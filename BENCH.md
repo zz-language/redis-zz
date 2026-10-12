@@ -1,7 +1,9 @@
 # BENCH.md — generated from bench/baseline.json (do not hand-edit numbers)
 
-Box: local-docker, engine VM. Median of 5 runs per bench, one line each
-(`name ops=N ms=M ops_per_s=R`).
+Box: local-docker, engine VM. Single run per bench, one line each
+(`name ops=N ms=M ops_per_s=R`). `ping` used to take the median of 5
+runs; it now does one 200-ping run so the file stays light — rerun it a
+few times and take the median yourself if you need noise control.
 
 Committed baseline: ping 200 ops / 461 ms (433 ops/s), get1k 100 ops /
 1245 ms (80 ops/s), pipe100 50 ops / 6871 ms (7 ops/s).
