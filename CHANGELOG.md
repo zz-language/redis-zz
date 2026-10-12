@@ -1,5 +1,9 @@
 # CHANGELOG.md
 
+## 0.1.1 (unreleased)
+
+- Package metadata: description + MIT license (registry warnings fixed).
+
 ## 0.1.0 (unreleased)
 
 - Core: errors/url/resp/transport/conn/client/cmds — TCP + TLS + Unix,
