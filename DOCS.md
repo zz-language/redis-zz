@@ -28,7 +28,8 @@ Custom options via `redis.connect_with(o)` with
 `?tls_insecure=1` (unverified, fires hook event),
 `?tls_sni=name` (hostname override), `redis+unix:///tmp/redis.sock?db=1`.
 Defaults: port 6379, db 0, pool 8, retries 3, proto 2. Error text never
-contains secrets (live redaction test enforces it).
+contains secrets (`import redis.url as url`, then `url.redacted(o)` to
+log a masked URL; the live redaction test enforces it).
 
 ## Error table
 

@@ -10,3 +10,15 @@ Gates (CI): pipelined-100 throughput ≥ 10× single-shot on the same
 engine; no bench regresses > 10% vs baseline; native single-conn is
 informational until a release-box baseline is committed (current numbers
 are VM-only on a shared box, so no native ratio is claimed here).
+
+## Reproduce
+
+```sh
+zz run bench/ping.zz     # ping ops=200 ms=... ops_per_s=...
+zz run bench/get1k.zz    # needs live redis on 127.0.0.1:6379
+zz run bench/pipe100.zz
+```
+
+Each bench prints one `name ops=N ms=M ops_per_s=R` line (median of 5).
+To re-baseline: run all three, paste the numbers into
+`bench/baseline.json`, and keep this file's table in sync.
