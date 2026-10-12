@@ -1,0 +1,101 @@
+// policy_test.zz — §10.2 retry-policy tables as pure unit tests (no server).
+//
+// Pins the idempotency classes from client.idempotent (the single source of
+// truth; retry.idem_cmd delegates to it) and the pure backoff schedule from
+// retry.backoff_ms. No sockets, deterministic under `zz test` in CI, VM and
+// native. Classes per plan v3 §10.2: read-only + idempotent-write retry on
+// IO errors; non-idempotent and unknown commands surface Ambiguous instead.
+import redis.client as client
+import redis.retry as retry
+
+// Read-only commands retry on IO/timeout/closed (plan §10.2 row 1).
+
+@test
+func policy_readonly_are_idempotent() {
+    for cmd in ["GET", "MGET", "EXISTS", "TTL", "PTTL", "TYPE", "STRLEN", "HGET", "HGETALL", "SMEMBERS", "ZRANGE", "PING"] {
+        assert(client.idempotent(cmd, 1))
+    }
+    for cmd in ["SCAN", "HSCAN", "SSCAN", "ZSCAN"] {
+        assert(client.idempotent(cmd, 2))
+    }
+}
+
+// Idempotent writes retry (row 2), incl plain 2-arg SET and EXPIRE.
+
+@test
+func policy_idempotent_writes() {
+    for cmd in ["DEL", "HSET", "SADD", "SREM", "ZADD", "PERSIST", "EXPIREAT", "SELECT"] {
+        assert(client.idempotent(cmd, 1))
+    }
+    assert(client.idempotent("SET", 2))
+    assert(client.idempotent("EXPIRE", 2))
+    assert(client.idempotent("DEL", 3))
+}
+
+// Non-idempotent commands never auto-retry: SET with options (3+ args),
+// unknown commands, counters, list pushes/pops, scripts, publish.
+
+@test
+func policy_non_idempotent() {
+    assert(client.idempotent("SET", 3) == false)
+    assert(client.idempotent("SET", 4) == false)
+    assert(client.idempotent("SET", 5) == false)
+    assert(client.idempotent("SET", 1) == false)
+    assert(client.idempotent("FOO", 1) == false)
+    assert(client.idempotent("FOO", 0) == false)
+    for cmd in ["INCR", "DECR", "HINCRBY", "ZINCRBY", "APPEND", "LPUSH", "RPUSH", "LPOP", "RPOP", "EVAL", "EVALSHA", "PUBLISH", "GETDEL", "GETSET"] {
+        assert(client.idempotent(cmd, 2) == false)
+    }
+}
+
+// Command matching is case-insensitive: lowercase behaves like upper.
+
+@test
+func policy_lowercase_matches_upper() {
+    assert(client.idempotent("get", 1))
+    assert(client.idempotent("ping", 0))
+    assert(client.idempotent("set", 2))
+    assert(client.idempotent("expire", 2))
+    assert(client.idempotent("incr", 1) == false)
+    assert(client.idempotent("foo", 1) == false)
+    assert(client.idempotent("set", 3) == false)
+    for lower in ["get", "mget", "del", "ttl", "scan", "hset", "expire", "select", "set", "incr", "foo"] {
+        assert_eq(client.idempotent(lower, 2), client.idempotent(pol_upper(lower), 2))
+    }
+}
+
+func pol_upper(s: str) -> str {
+    out := ""
+    for b in str.bytes(s) {
+        c := b
+        if c >= 97 && c <= 122 {
+            c = c - 32
+        }
+        out = out + str.chr(c)
+    }
+    out
+}
+
+// Pure backoff schedule min(1000, 20*2^attempt): attempts 0..4 give
+// 20/40/80/160/320, attempt 5 gives 640, large attempts cap at 1000ms.
+
+@test
+func policy_backoff_table() {
+    assert_eq(retry.backoff_ms(0), 20)
+    assert_eq(retry.backoff_ms(1), 40)
+    assert_eq(retry.backoff_ms(2), 80)
+    assert_eq(retry.backoff_ms(3), 160)
+    assert_eq(retry.backoff_ms(4), 320)
+    assert_eq(retry.backoff_ms(5), 640)
+    assert_eq(retry.backoff_ms(20), 1000)
+}
+
+// The retry alias delegates to the same table (single source of truth).
+
+@test
+func policy_retry_alias_agrees() {
+    assert(retry.idem_cmd("GET", 1))
+    assert(retry.idem_cmd("SET", 2))
+    assert(retry.idem_cmd("SET", 3) == false)
+    assert(retry.idem_cmd("INCR", 1) == false)
+}

@@ -1,0 +1,66 @@
+import redis
+import redis.errors as errors
+
+func db_keys() -> [str] {
+    ["zz:ex:cache:user:1", "zz:ex:cache:user:2"]
+}
+
+func db_vals() -> [str] {
+    ["alice", "bob"]
+}
+
+func db_lookup(key: str) -> Option<str> {
+    ks := db_keys()
+    vs := db_vals()
+    i := 0
+    while i < ks.len() {
+        if ks[i] == key {
+            return .some(vs[i])
+        }
+        i = i + 1
+    }
+    .none
+}
+
+func load(c: redis.Client, key: str) -> Result<str, redis.RError> {
+    match c.get(key)? {
+        .some(v) => load_cached(v)
+        .none => load_fill(c, key)
+    }
+}
+
+func load_cached(v: str) -> Result<str, redis.RError> {
+    println("src=cache val={v}")
+    .ok(v)
+}
+
+func load_fill(c: redis.Client, key: str) -> Result<str, redis.RError> {
+    match db_lookup(key) {
+        .some(v) => load_store(c, key, v)
+        .none => load_absent(key)
+    }
+}
+
+func load_store(c: redis.Client, key: str, val: str) -> Result<str, redis.RError> {
+    _u9 := c.set(key, val, 300)?
+    println("src=db val={val}")
+    .ok(val)
+}
+
+func load_absent(key: str) -> Result<str, redis.RError> {
+    .err(errors.redis_error("CACHE_MISS", key))
+}
+
+func main() -> Result<int, redis.RError> {
+    c := redis.connect("redis://127.0.0.1:6379")?
+    _u1 := c.del(["zz:ex:cache:user:1"])?
+    v1 := load(c, "zz:ex:cache:user:1")?
+    v2 := load(c, "zz:ex:cache:user:1")?
+    assert(v1 == "alice")
+    assert(v2 == "alice")
+    assert(v1 == v2)
+    _u2 := c.del(["zz:ex:cache:user:1"])?
+    _u3 := c.close()
+    println("cache_aside_ok")
+    .ok(0)
+}

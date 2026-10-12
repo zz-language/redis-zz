@@ -1,0 +1,53 @@
+import redis
+import redis.conn as conn
+import redis.resp as resp
+
+func pop_one(c: redis.Client, key: str) -> Result<Option<str>, redis.RError> {
+    r := c.do("BRPOP", [key, "1"])?
+    if resp.is_null(r.arena, conn.reply_value(r)) {
+        return .ok(.none)
+    }
+    match resp.as_array(r.arena, conn.reply_value(r)) {
+        .ok(kids) => pop_val(r.arena, kids)
+        .err(e) => .err(e)
+    }
+}
+
+func pop_val(a: resp.Arena, kids: [resp.Value]) -> Result<Option<str>, redis.RError> {
+    match resp.as_str(a, kids[1]) {
+        .ok(s) => .ok(.some(s))
+        .err(e) => .err(e)
+    }
+}
+
+func show_pop(c: redis.Client, key: str, n: int) -> Result<int, redis.RError> {
+    match pop_one(c, key)? {
+        .some(v) => show_item(n, v)
+        .none => show_empty(n)
+    }
+}
+
+func show_item(n: int, v: str) -> Result<int, redis.RError> {
+    println("pop{n}={v}")
+    .ok(0)
+}
+
+func show_empty(n: int) -> Result<int, redis.RError> {
+    println("pop{n}=empty")
+    .ok(0)
+}
+
+func main() -> Result<int, redis.RError> {
+    c := redis.connect("redis://127.0.0.1:6379?timeout_ms=3000")?
+    _u1 := c.del(["zz:ex:queue"])?
+    _u2 := c.do("LPUSH", ["zz:ex:queue", "m1", "m2", "m3"])?
+    println("enqueued=3")
+    _u3 := show_pop(c, "zz:ex:queue", 1)?
+    _u4 := show_pop(c, "zz:ex:queue", 2)?
+    _u5 := show_pop(c, "zz:ex:queue", 3)?
+    _u6 := show_pop(c, "zz:ex:queue", 4)?
+    _u7 := c.del(["zz:ex:queue"])?
+    _u8 := c.close()
+    println("queue_ok")
+    .ok(0)
+}

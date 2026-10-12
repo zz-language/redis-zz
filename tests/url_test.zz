@@ -1,0 +1,275 @@
+// url_test.zz — table-driven URL parser tests (plan v3 §7).
+// Pure parsing only, no network: safe under `zz test` in CI, both engines.
+import std.str
+
+import redis.errors as errors
+import redis.url as url
+
+func must_parse(raw: str) -> url.Options {
+    match url.parse(raw) {
+        .ok(o) => o
+        .err(e) => {
+            println("UNEXPECTED ERROR for {raw}: {errors.message(e)}")
+            assert(false)
+            url.Options{scheme: "", host: "", port: 0, user: "", pass: "", db: 0, name: "", connect_ms: 0, read_ms: 0, write_ms: 0, pool: 0, retries: 0, proto: 0, tls: false, tls_ca: "", tls_sni: "", tls_insecure: false, unix: ""}
+        }
+    }
+}
+
+func must_fail_kind(raw: str) -> errors.RError {
+    match url.parse(raw) {
+        .ok(_) => {
+            println("UNEXPECTED OK for {raw}")
+            assert(false)
+            errors.url_error("", "")
+        }
+        .err(e) => e
+    }
+}
+
+@test
+func minimal_url_gets_all_defaults() {
+    o := must_parse("redis://localhost")
+    assert_eq(o.scheme, "redis")
+    assert_eq(o.host, "localhost")
+    assert_eq(o.port, 6379)
+    assert_eq(o.user, "")
+    assert_eq(o.pass, "")
+    assert_eq(o.db, 0)
+    assert_eq(o.name, "redis-zz")
+    assert_eq(o.connect_ms, 1000)
+    assert_eq(o.read_ms, 500)
+    assert_eq(o.write_ms, 500)
+    assert_eq(o.pool, 8)
+    assert_eq(o.retries, 3)
+    assert_eq(o.proto, 2)
+    assert(o.tls == false)
+    assert_eq(o.tls_ca, "")
+    assert_eq(o.tls_sni, "")
+    assert(o.tls_insecure == false)
+    assert_eq(o.unix, "")
+}
+
+@test
+func host_port_db_path() {
+    o := must_parse("redis://localhost:6380/2")
+    assert_eq(o.host, "localhost")
+    assert_eq(o.port, 6380)
+    assert_eq(o.db, 2)
+}
+
+@test
+func rediss_sets_tls_with_password_only_user() {
+    o := must_parse("rediss://:s3cret@db.example.com:6380/0")
+    assert(o.tls)
+    assert_eq(o.scheme, "rediss")
+    assert_eq(o.user, "")
+    assert_eq(o.pass, "s3cret")
+    assert_eq(o.host, "db.example.com")
+    assert_eq(o.port, 6380)
+}
+
+@test
+func user_without_pass_is_acl_ok() {
+    o := must_parse("redis://alice@h/1")
+    assert_eq(o.user, "alice")
+    assert_eq(o.pass, "")
+    assert_eq(o.db, 1)
+}
+
+@test
+func all_query_params() {
+    o := must_parse("redis://h?timeout_ms=200&connect_timeout_ms=300&pool=4&retries=5&proto=3&name=my-app&tls_ca=/ca.pem&tls_insecure=1&tls_sni=db.internal")
+    assert_eq(o.read_ms, 200)
+    assert_eq(o.write_ms, 200)
+    assert_eq(o.connect_ms, 300)
+    assert_eq(o.pool, 4)
+    assert_eq(o.retries, 5)
+    assert_eq(o.proto, 3)
+    assert_eq(o.name, "my-app")
+    assert_eq(o.tls_ca, "/ca.pem")
+    assert(o.tls_insecure)
+    assert_eq(o.tls_sni, "db.internal")
+}
+
+@test
+func timeout_ms_sets_read_and_write() {
+    o := must_parse("redis://h?timeout_ms=50")
+    assert_eq(o.read_ms, 50)
+    assert_eq(o.write_ms, 50)
+    assert_eq(o.connect_ms, 1000)
+}
+
+@test
+func unix_socket_with_db_query() {
+    o := must_parse("redis+unix:///tmp/redis.sock?db=1")
+    assert_eq(o.scheme, "redis+unix")
+    assert_eq(o.unix, "/tmp/redis.sock")
+    assert_eq(o.db, 1)
+    assert_eq(o.host, "")
+    assert(o.tls == false)
+}
+
+@test
+func unix_socket_defaults_db_zero() {
+    o := must_parse("redis+unix:///var/run/r.sock")
+    assert_eq(o.unix, "/var/run/r.sock")
+    assert_eq(o.db, 0)
+}
+
+@test
+func password_percent_decoding() {
+    o := must_parse("redis://u:p%40ss%3Aw%2Brd%25x@h/")
+    assert_eq(o.pass, "p@ss:w+rd%x")
+    assert_eq(o.user, "u")
+    assert_eq(o.db, 0)
+}
+
+@test
+func plus_in_password_stays_literal() {
+    o := must_parse("redis://u:a+b@h")
+    assert_eq(o.pass, "a+b")
+}
+
+@test
+func colon_with_empty_pass_is_an_error() {
+    e := must_fail_kind("redis://user:@h")
+    assert_eq(e.kind, "url")
+    assert(str.contains(e.detail, "empty_password"))
+}
+
+@test
+func bad_percent_encoding_is_an_error() {
+    e := must_fail_kind("redis://u:ab%2@h")
+    assert_eq(e.kind, "url")
+    assert(str.contains(e.detail, "bad_password"))
+    e2 := must_fail_kind("redis://u:ab%zz@h")
+    assert(str.contains(e2.detail, "bad_password"))
+}
+
+@test
+func unsupported_scheme_names_itself() {
+    e := must_fail_kind("http://h/")
+    assert_eq(e.kind, "url")
+    assert(str.contains(e.detail, "unsupported_scheme"))
+    assert(str.contains(e.detail, "http"))
+    e2 := must_fail_kind("localhost:6379")
+    assert(str.contains(e2.detail, "unsupported_scheme"))
+}
+
+@test
+func missing_host() {
+    e := must_fail_kind("redis:///0")
+    assert_eq(e.kind, "url")
+    assert(str.contains(e.detail, "missing_host"))
+}
+
+@test
+func bad_ports() {
+    for raw in ["redis://h:abc", "redis://h:0", "redis://h:99999", "redis://h:", "redis://h:12x"] {
+        e := must_fail_kind(raw)
+        assert_eq(e.kind, "url")
+        assert(str.contains(e.detail, "bad_port"))
+    }
+    o := must_parse("redis://h:1")
+    assert_eq(o.port, 1)
+    o2 := must_parse("redis://h:65535")
+    assert_eq(o2.port, 65535)
+}
+
+@test
+func db_out_of_range() {
+    e := must_fail_kind("redis://h/16")
+    assert_eq(e.kind, "url")
+    assert(str.contains(e.detail, "db_out_of_range"))
+    assert(str.contains(e.detail, "16"))
+    e2 := must_fail_kind("redis://h/abc")
+    assert(str.contains(e2.detail, "db_out_of_range"))
+    e3 := must_fail_kind("redis://h?db=99")
+    assert(str.contains(e3.detail, "db_out_of_range"))
+    o := must_parse("redis://h/15")
+    assert_eq(o.db, 15)
+}
+
+@test
+func unknown_param_suggests_did_you_mean() {
+    e := must_fail_kind("redis://h?tmeout_ms=5")
+    assert_eq(e.kind, "url")
+    assert(str.contains(e.detail, "unknown_param"))
+    assert(str.contains(e.detail, "did you mean"))
+    assert(str.contains(e.detail, "timeout_ms"))
+    e2 := must_fail_kind("redis://h?bogus=1")
+    assert(str.contains(e2.detail, "did you mean"))
+}
+
+@test
+func ipv6_bracket_host() {
+    o := must_parse("redis://[::1]:6380/0")
+    assert_eq(o.host, "::1")
+    assert_eq(o.port, 6380)
+    o2 := must_parse("redis://[::1]")
+    assert_eq(o2.host, "::1")
+    assert_eq(o2.port, 6379)
+}
+
+@test
+func query_db_overrides_path_db() {
+    o := must_parse("redis://h/2?db=5")
+    assert_eq(o.db, 5)
+}
+
+@test
+func bare_tls_insecure_flag_means_on() {
+    o := must_parse("rediss://h?tls_insecure")
+    assert(o.tls_insecure)
+    o2 := must_parse("rediss://h?tls_insecure=0")
+    assert(o2.tls_insecure == false)
+}
+
+@test
+func fragments_rejected() {
+    e := must_fail_kind("redis://h/0#frag")
+    assert_eq(e.kind, "url")
+    assert(str.contains(e.detail, "fragment"))
+}
+
+@test
+func bad_query_values() {
+    e := must_fail_kind("redis://h?pool=0")
+    assert(str.contains(e.detail, "bad_query"))
+    e2 := must_fail_kind("redis://h?proto=1")
+    assert(str.contains(e2.detail, "bad_query"))
+    e3 := must_fail_kind("redis://h?retries=many")
+    assert(str.contains(e3.detail, "bad_query"))
+}
+
+@test
+func redacted_masks_password_keeps_shape() {
+    o := must_parse("redis://alice:s3cret@h:6380/2?pool=4")
+    r := url.redacted(o)
+    assert_eq(r, "redis://alice:***@h:6380/2?pool=4")
+    assert(str.contains(r, "***"))
+    assert(str.contains(r, "s3cret") == false)
+}
+
+@test
+func redacted_minimal_has_no_leak() {
+    o := must_parse("redis://h")
+    assert_eq(url.redacted(o), "redis://h")
+    o2 := must_parse("rediss://:pw@h/0")
+    r2 := url.redacted(o2)
+    assert(str.contains(r2, "***"))
+    assert(str.contains(r2, "pw") == false)
+}
+
+@test
+func redacted_unix_roundtrip() {
+    o := must_parse("redis+unix:///tmp/r.sock?db=1")
+    assert_eq(url.redacted(o), "redis+unix:///tmp/r.sock?db=1")
+}
+
+@test
+func redacted_user_without_pass() {
+    o := must_parse("redis://bob@h")
+    assert_eq(url.redacted(o), "redis://bob@h")
+}

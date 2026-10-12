@@ -1,0 +1,485 @@
+// mock.zz — in-memory test fake, subset only (plan v3 §13, test-only).
+//
+// Non-goals (do NOT rely on these): single-threaded semantics, no
+// persistence, expiry on lazy access only, no pub/sub, no transactions
+// beyond queued MULTI/EXEC, MAY DIFFER from real Redis in edge cases.
+// Live integration tests remain mandatory. Never auto-substituted: you
+// opt in by constructing a Mock.
+//
+// State lives in a cell so volvulus-free functional code can still share
+// one fake across calls. Fault injection for retry-handling tests:
+// fail_next(kind) makes the next command fail closed ("io", "timeout",
+// "conflict"), delay_ms(ms) sleeps before the next command.
+import std.cell
+import std.time
+
+import redis.errors as errors
+
+pub struct Mock {
+    st: cell,
+}
+
+struct MState {
+    keys: [str],
+    vals: [str],
+    exps: [int],
+    fail_next: str,
+    delay_ms: int,
+    watch_trip: bool,
+    in_multi: bool,
+    queued: [[str]],
+}
+
+pub func new() -> Mock {
+    Mock{st: cell.new(MState{keys: [], vals: [], exps: [], fail_next: "", delay_ms: 0, watch_trip: false, in_multi: false, queued: []})}
+}
+
+func load(m: Mock) -> MState {
+    match cell.get(m.st) {
+        .ok(s) => {
+            st: MState = s
+            st
+        }
+        .err(_) => MState{keys: [], vals: [], exps: [], fail_next: "", delay_ms: 0, watch_trip: false, in_multi: false, queued: []}
+    }
+}
+
+func store(m: Mock, s: MState) -> int {
+    match cell.set(m.st, s) {
+        .ok(_) => 0
+        .err(_) => 0
+    }
+}
+
+func now_ms() -> int {
+    time.now_micros() / 1000
+}
+
+// Fault injection: the next command fails with kind ("io" interviewed as
+// closed/command, "timeout" as timeout/read, anything else as redis ERR).
+pub func fail_next(m: Mock, kind: str) -> int {
+    s := load(m)
+    s.fail_next = kind
+    store(m, s)
+}
+
+// Fault injection: sleep ms before the next command (timeout testing).
+pub func delay_ms(m: Mock, ms: int) -> int {
+    s := load(m)
+    s.delay_ms = ms
+    store(m, s)
+}
+
+// Fault injection: the next EXEC trips WATCH (conflict).
+pub func trip_watch(m: Mock) -> int {
+    s := load(m)
+    s.watch_trip = true
+    store(m, s)
+}
+
+func take_fault(m: Mock, s: MState) -> Result<MState, errors.RError> {
+    if s.delay_ms > 0 {
+        time.sleep_ms(s.delay_ms)
+        s.delay_ms = 0
+    }
+    if s.fail_next == "" {
+        .ok(s)
+    } else if s.fail_next == "io" {
+        s.fail_next = ""
+        store(m, s)
+        .err(errors.closed_error("command"))
+    } else if s.fail_next == "timeout" {
+        s.fail_next = ""
+        store(m, s)
+        .err(errors.timeout_error("read"))
+    } else if s.fail_next == "conflict" {
+        s.fail_next = ""
+        store(m, s)
+        .err(errors.conflict_error())
+    } else {
+        kind := s.fail_next
+        s.fail_next = ""
+        store(m, s)
+        .err(errors.redis_error("ERR", kind))
+    }
+}
+
+func find_key(s: MState, key: str) -> int {
+    i := 0
+    while i < s.keys.len() {
+        if s.keys[i] == key {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+func is_live(s: MState, i: int) -> bool {
+    exp := s.exps[i]
+    if exp == 0 {
+        return true
+    }
+    now_ms() < exp
+}
+
+func set_at_str(xs: [str], i: int, v: str) -> [str] {
+    out: [str] = []
+    j := 0
+    while j < xs.len() {
+        if j == i {
+            out = out.push(v)
+        } else {
+            out = out.push(xs[j])
+        }
+        j = j + 1
+    }
+    out
+}
+
+func set_at_int(xs: [int], i: int, v: int) -> [int] {
+    out: [int] = []
+    j := 0
+    while j < xs.len() {
+        if j == i {
+            out = out.push(v)
+        } else {
+            out = out.push(xs[j])
+        }
+        j = j + 1
+    }
+    out
+}
+
+func drop_at(s: MState, i: int) -> MState {
+    keys: [str] = []
+    vals: [str] = []
+    exps: [int] = []
+    j := 0
+    while j < s.keys.len() {
+        if j != i {
+            keys = keys.push(s.keys[j])
+            vals = vals.push(s.vals[j])
+            exps = exps.push(s.exps[j])
+        }
+        j = j + 1
+    }
+    MState{keys: keys, vals: vals, exps: exps, fail_next: s.fail_next, delay_ms: s.delay_ms, watch_trip: s.watch_trip, in_multi: s.in_multi, queued: s.queued}
+}
+
+func put_key(s: MState, key: str, val: str, exp: int) -> MState {
+    i := find_key(s, key)
+    if i >= 0 {
+        vals := s.vals
+        vals = set_at_str(vals, i, val)
+        exps := s.exps
+        exps = set_at_int(exps, i, exp)
+        return MState{keys: s.keys, vals: vals, exps: exps, fail_next: s.fail_next, delay_ms: s.delay_ms, watch_trip: s.watch_trip, in_multi: s.in_multi, queued: s.queued}
+    }
+    MState{keys: s.keys.push(key), vals: s.vals.push(val), exps: s.exps.push(exp), fail_next: s.fail_next, delay_ms: s.delay_ms, watch_trip: s.watch_trip, in_multi: s.in_multi, queued: s.queued}
+}
+
+pub func ping(m: Mock) -> Result<str, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(_) => .ok("PONG")
+        .err(e) => .err(e)
+    }
+}
+
+pub func get(m: Mock, key: str) -> Result<Option<str>, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(s) => {
+            i := find_key(s, key)
+            if i < 0 {
+                return .ok(.none)
+            }
+            if !is_live(s, i) {
+                store(m, drop_at(s, i))
+                return .ok(.none)
+            }
+            .ok(.some(s.vals[i]))
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func set(m: Mock, key: str, val: str, ttl: int) -> Result<int, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(s) => {
+            exp := 0
+            if ttl > 0 {
+                exp = now_ms() + ttl * 1000
+            }
+            store(m, put_key(s, key, val, exp))
+            .ok(0)
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func del(m: Mock, keys: [str]) -> Result<int, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(s) => {
+            n := 0
+            cur := s
+            for k in keys {
+                i := find_key(cur, k)
+                if i >= 0 && is_live(cur, i) {
+                    cur = drop_at(cur, i)
+                    n = n + 1
+                }
+            }
+            store(m, cur)
+            .ok(n)
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func exists(m: Mock, key: str) -> Result<int, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(s) => {
+            i := find_key(s, key)
+            if i >= 0 && is_live(s, i) {
+                .ok(1)
+            } else {
+                .ok(0)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func expire(m: Mock, key: str, ttl: int) -> Result<int, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(s) => {
+            i := find_key(s, key)
+            if i < 0 || !is_live(s, i) {
+                .ok(0)
+            } else {
+                exps := s.exps
+                exps = set_at_int(exps, i, now_ms() + ttl * 1000)
+                store(m, MState{keys: s.keys, vals: s.vals, exps: exps, fail_next: s.fail_next, delay_ms: s.delay_ms, watch_trip: s.watch_trip, in_multi: s.in_multi, queued: s.queued})
+                .ok(1)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func ttl(m: Mock, key: str) -> Result<int, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(s) => {
+            i := find_key(s, key)
+            if i < 0 {
+                .ok(-2)
+            } else if !is_live(s, i) {
+                store(m, drop_at(s, i))
+                .ok(-2)
+            } else if s.exps[i] == 0 {
+                .ok(-1)
+            } else {
+                .ok((s.exps[i] - now_ms()) / 1000)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func incr(m: Mock, key: str) -> Result<int, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(s) => {
+            cur := 0
+            i := find_key(s, key)
+            base := s
+            if i >= 0 {
+                if !is_live(s, i) {
+                    base = drop_at(s, i)
+                    i = -1
+                } else {
+                    match int_of_str(s.vals[i]) {
+                        .ok(v) => {
+                            cur = v
+                        }
+                        .err(_) => return .err(errors.redis_error("ERR", "value is not an integer"))
+                    }
+                }
+            }
+            cur = cur + 1
+            store(m, put_key(base, key, "{cur}", 0))
+            .ok(cur)
+        }
+        .err(e) => .err(e)
+    }
+}
+
+func int_of_str(s: str) -> Result<int, str> {
+    neg := false
+    t := s
+    if t.len() > 0 && t[0:1] == "-" {
+        neg = true
+        t = t[1:]
+    }
+    if t.len() == 0 {
+        return .err("nan")
+    }
+    n := 0
+    for b in str.bytes(t) {
+        if b < 48 || b > 57 {
+            return .err("nan")
+        }
+        n = n * 10 + (b - 48)
+    }
+    if neg {
+        n = 0 - n
+    }
+    .ok(n)
+}
+
+pub func mget(m: Mock, keys: [str]) -> Result<[Option<str>], errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(_) => mget_keys(m, keys)
+        .err(e) => .err(e)
+    }
+}
+
+func mget_keys(m: Mock, keys: [str]) -> Result<[Option<str>], errors.RError> {
+    out: [Option<str>] = []
+    for k in keys {
+        match get(m, k) {
+            .ok(v) => {
+                out = out.push(v)
+            }
+            .err(e) => return .err(e)
+        }
+    }
+    .ok(out)
+}
+
+// Generic path: by-name subset (unknown commands are redis ERRORS here,
+// never guesses — real extensibility lives in do()).
+pub func do(m: Mock, cmd: str, args: [str]) -> Result<str, errors.RError> {
+    c := upper(cmd)
+    if c == "PING" {
+        return ping(m)
+    }
+    if c == "GET" && args.len() == 1 {
+        return do_get(m, args[0])
+    }
+    if c == "SET" && args.len() >= 2 {
+        return do_set(m, args)
+    }
+    .err(errors.redis_error("ERR", "mock: unknown command {c}"))
+}
+
+func do_get(m: Mock, key: str) -> Result<str, errors.RError> {
+    match get(m, key) {
+        .ok(v) => {
+            match v {
+                .some(s) => .ok(s)
+                .none => .err(errors.protocol_error("mock_nil"))
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+func do_set(m: Mock, args: [str]) -> Result<str, errors.RError> {
+    ttl := 0
+    if args.len() >= 4 && upper(args[2]) == "EX" {
+        match int_of_str(args[3]) {
+            .ok(v) => {
+                ttl = v
+            }
+            .err(_) => return .err(errors.redis_error("ERR", "bad expire"))
+        }
+    }
+    match set(m, args[0], args[1], ttl) {
+        .ok(_) => .ok("OK")
+        .err(e) => .err(e)
+    }
+}
+
+func upper(s: str) -> str {
+    out := ""
+    for b in str.bytes(s) {
+        c := b
+        if c >= 97 && c <= 122 {
+            c = c - 32
+        }
+        out = out + str.chr(c)
+    }
+    out
+}
+
+// MULTI/EXEC: queue while open, apply atomically on exec (single-threaded
+// apply; no interleaving inside exec). WATCH trips only when injected.
+pub func multi_begin(m: Mock) -> Result<int, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(s) => {
+            s.in_multi = true
+            s.queued = []
+            store(m, s)
+            .ok(0)
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func multi_queue(m: Mock, cmd: str, args: [str]) -> Result<int, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(s) => {
+            if !s.in_multi {
+                return .err(errors.redis_error("ERR", "MULTI required"))
+            }
+            full := [cmd]
+            for a in args {
+                full = full.push(a)
+            }
+            s.queued = s.queued.push(full)
+            store(m, s)
+            .ok(0)
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func multi_exec(m: Mock) -> Result<int, errors.RError> {
+    match take_fault(m, load(m)) {
+        .ok(s) => {
+            if !s.in_multi {
+                return .err(errors.redis_error("ERR", "MULTI required"))
+            }
+            s.in_multi = false
+            q := s.queued
+            s.queued = []
+            if s.watch_trip {
+                s.watch_trip = false
+                store(m, s)
+                return .err(errors.conflict_error())
+            }
+            store(m, s)
+            for cmd in q {
+                if cmd.len() == 0 {
+                    return .err(errors.redis_error("ERR", "mock: empty queued command"))
+                }
+                args: [str] = []
+                i := 1
+                while i < cmd.len() {
+                    args = args.push(cmd[i])
+                    i = i + 1
+                }
+                match do(m, cmd[0], args) {
+                    .ok(_) => 0
+                    .err(e) => return .err(e)
+                }
+            }
+            .ok(q.len())
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func flush(m: Mock) -> int {
+    store(m, MState{keys: [], vals: [], exps: [], fail_next: "", delay_ms: 0, watch_trip: false, in_multi: false, queued: []})
+}

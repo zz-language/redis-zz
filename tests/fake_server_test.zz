@@ -1,0 +1,1098 @@
+// fake_server_test.zz — scripted RESP over loopback TCP, no redis server.
+//
+// Each test spawns tests/helpers/fsrv.zz as a CHILD PROCESS (single-exit
+// pattern: every failure is counted, the child is always reaped, one final
+// assert). The child answers the client handshake (two CLIENT SETINFO get
+// +OK) plus scripted command replies; the parent drives the REAL client
+// single-threaded and then asserts on the reply AND the child's stdout
+// report lines.
+//
+// Why processes and not task.spawn + std.chan: in-process scripted servers
+// flaked ~50% per round-trip on this toolchain (interpreter shell-pool
+// race, RefCell panics in env.rs under concurrent net IO), while the
+// child-process shape is 10/10 deterministic. See the plan §14.2 layer 2;
+// the layer's cases are all covered, only the transport differs.
+//
+// Reply SPEC directives (fsrv "fake" mode): a plain RESP payload is written
+// verbatim, "SEND_CLOSE:<payload>" writes then closes (short reads),
+// "SPLIT:n:<payload>" drip-feeds n bytes at a time with 5ms sleeps, and
+// "CLOSE" closes without replying.
+//
+// Ports are pid/token-derived (fx_port) so parallel runners never share
+// them. Client timeouts are generous (3s) so parallel-compile load can
+// never fire them spuriously; every dial uses retries=0 (except the
+// redial-leg cases, which have none here) so IO failures surface with
+// their first kind instead of redialing into refused.
+import std.env
+import std.net
+import std.process
+import std.str
+import std.time
+
+import redis.client as client
+import redis.conn as conn
+import redis.errors as errors
+import redis.resp as resp
+import redis.url as url
+
+// ---- Child-process harness ----
+
+func fx_zz() -> str {
+    "/home/zaid/.cargo/bin/zz"
+}
+
+func fx_srv() -> str {
+    cwd := env.cwd() ?? "."
+    "{cwd}/tests/helpers/fsrv.zz"
+}
+
+// Loopback port for test idx. Tests run as separate OS processes with
+// (near-)sequential pids, so a plain pid()+idx scheme collides
+// systematically; instead each pid owns a 32-wide lane and idx (<32)
+// picks within it. Distinct pids land 32+ apart, so ports are unique
+// across concurrent tests; the sweep token (run-global) only adds skew.
+
+func fx_port(idx: int) -> int {
+    sweep_tok := env.get("ZZ_SWEEP_TOKEN") ?? "0"
+    tok_num := int(str.replace(sweep_tok, "t", "")) ?? 0
+    34000 + (process.pid() % 500) * 32 + tok_num % 32 + idx
+}
+
+func fx_spawn(args: [str]) -> Result<process, str> {
+    argv := ["run", fx_srv()]
+    for a in args {
+        argv = argv.push(a)
+    }
+    process.spawn(fx_zz(), argv)
+}
+
+// Raw-connect readiness poll: waits for the child to listen (up to ~18s),
+// then closes without sending (the child's tolerated probe session).
+// Returns 0 when ready, -1 on exhaustion.
+
+func fx_poll(port: int, tries: int) -> int {
+    if tries <= 0 {
+        return 0 - 1
+    }
+    match net.tcp_connect("127.0.0.1:{port}", 300) {
+        .ok(raw) => fx_poll_hit(raw)
+        .err(_) => fx_poll_miss(port, tries)
+    }
+}
+
+func fx_poll_hit(raw: tcp.stream) -> int {
+    _u1 := raw.close()
+    0
+}
+
+func fx_poll_miss(port: int, tries: int) -> int {
+    time.sleep_ms(200)
+    fx_poll(port, tries - 1)
+}
+
+// Dial the fake server with generous timeouts and no retries: the first
+// error kind is the assertion target, never a redial artifact.
+
+func fx_dial(port: int) -> Result<client.Client, errors.RError> {
+    match url.parse("redis://127.0.0.1:{port}?connect_timeout_ms=1000&timeout_ms=3000&retries=0") {
+        .ok(o) => client.connect_with(o)
+        .err(e) => .err(e)
+    }
+}
+
+// Reap the child into one "code=N out=..." string for contains-asserts.
+
+func fx_reap(ch: process) -> str {
+    match process.wait(ch) {
+        .ok(t) => fx_reap_ok(t)
+        .err(e) => "code=-1 out=WAITFAIL {e}"
+    }
+}
+
+func fx_reap_ok(t: [int | str | str]) -> str {
+    "code={t[0]} out={t[1]}"
+}
+
+func fx_check_report(rep: str, want: str, bad: int) -> int {
+    if str.contains(rep, want) == false {
+        println("FAIL report missing {want}: {rep}")
+        return bad + 1
+    }
+    bad
+}
+
+// ---- Cases (single-exit: count, reap, then assert) ----
+
+@test
+func fake_dollar_neg1_is_none() {
+    port := fx_port(1)
+    _u9 := match fx_spawn(["fake", "{port}", "$-1\r\n"]) {
+        .ok(ch) => fake_dollar_neg1_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// $-1 is a cache miss: a value (None), never an error.
+
+func fake_dollar_neg1_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_dollar_neg1_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_dollar_neg1_check(c: client.Client) -> int {
+    match client.exchange(c, ["GET", "k"], true, 0) {
+        .ok(r) => fake_dollar_neg1_value(c, r)
+        .err(e) => {
+            println("FAIL exchange {e.kind} {e.detail}")
+            1
+        }
+    }
+}
+
+func fake_dollar_neg1_value(c: client.Client, r: conn.Reply) -> int {
+    bad := 0
+    if resp.is_null(r.arena, conn.reply_value(r)) == false {
+        println("FAIL want null")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+@test
+func fake_star_neg1_is_none() {
+    port := fx_port(2)
+    _u9 := match fx_spawn(["fake", "{port}", "*-1\r\n"]) {
+        .ok(ch) => fake_star_neg1_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// *-1 is the same nil through the array path.
+
+func fake_star_neg1_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_star_neg1_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_star_neg1_check(c: client.Client) -> int {
+    match client.exchange(c, ["MGET", "a", "b"], true, 0) {
+        .ok(r) => fake_star_neg1_value(c, r)
+        .err(e) => {
+            println("FAIL exchange {e.kind} {e.detail}")
+            1
+        }
+    }
+}
+
+func fake_star_neg1_value(c: client.Client, r: conn.Reply) -> int {
+    bad := 0
+    if resp.is_null(r.arena, conn.reply_value(r)) == false {
+        println("FAIL want null")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+@test
+func fake_star_zero_is_empty() {
+    port := fx_port(3)
+    _u9 := match fx_spawn(["fake", "{port}", "*0\r\n"]) {
+        .ok(ch) => fake_star_zero_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func fake_star_zero_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_star_zero_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_star_zero_check(c: client.Client) -> int {
+    match client.exchange(c, ["MGET", "a"], true, 0) {
+        .ok(r) => fake_star_zero_value(c, r)
+        .err(e) => {
+            println("FAIL exchange {e.kind} {e.detail}")
+            1
+        }
+    }
+}
+
+func fake_star_zero_value(c: client.Client, r: conn.Reply) -> int {
+    match resp.as_array(r.arena, conn.reply_value(r)) {
+        .ok(kids) => fake_star_zero_kids(c, kids)
+        .err(e) => {
+            println("FAIL as_array {e.kind}")
+            1
+        }
+    }
+}
+
+func fake_star_zero_kids(c: client.Client, kids: [resp.Value]) -> int {
+    bad := 0
+    if kids.len() != 0 {
+        println("FAIL want empty array")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+@test
+func fake_empty_bulk_is_empty_str() {
+    port := fx_port(4)
+    _u9 := match fx_spawn(["fake", "{port}", "$0\r\n\r\n"]) {
+        .ok(ch) => fake_empty_bulk_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func fake_empty_bulk_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_empty_bulk_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_empty_bulk_check(c: client.Client) -> int {
+    match client.exchange(c, ["GET", "k"], true, 0) {
+        .ok(r) => fake_empty_bulk_value(c, r)
+        .err(e) => {
+            println("FAIL exchange {e.kind} {e.detail}")
+            1
+        }
+    }
+}
+
+func fake_empty_bulk_value(c: client.Client, r: conn.Reply) -> int {
+    bad := 0
+    if resp.is_null(r.arena, conn.reply_value(r)) {
+        println("FAIL want empty string, got null")
+        bad = bad + 1
+    }
+    match resp.as_str(r.arena, conn.reply_value(r)) {
+        .ok(s) => fake_empty_bulk_str(c, s, bad)
+        .err(e) => {
+            println("FAIL as_str {e.kind}")
+            bad + 1
+        }
+    }
+}
+
+func fake_empty_bulk_str(c: client.Client, s: str, bad: int) -> int {
+    nb := bad
+    if s != "" {
+        println("FAIL want empty string")
+        nb = bad + 1
+    }
+    _u1 := client.close(c)
+    nb
+}
+
+@test
+func fake_nested_arrays_split_fed() {
+    port := fx_port(5)
+    _u9 := match fx_spawn(["fake", "{port}", "SPLIT:4:*2\r\n*2\r\n+a\r\n+b\r\n*0\r\n"]) {
+        .ok(ch) => fake_nested_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// Nested arrays survive 4-byte drip-feed with structure intact.
+
+func fake_nested_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_nested_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_nested_check(c: client.Client) -> int {
+    match client.exchange(c, ["EXEC"], true, 0) {
+        .ok(r) => fake_nested_value(c, r)
+        .err(e) => {
+            println("FAIL exchange {e.kind} {e.detail}")
+            1
+        }
+    }
+}
+
+func fake_nested_value(c: client.Client, r: conn.Reply) -> int {
+    match resp.as_array(r.arena, conn.reply_value(r)) {
+        .ok(kids) => fake_nested_kids(c, r.arena, kids)
+        .err(e) => {
+            println("FAIL as_array {e.kind}")
+            1
+        }
+    }
+}
+
+func fake_nested_kids(c: client.Client, a: resp.Arena, kids: [resp.Value]) -> int {
+    bad := 0
+    if kids.len() != 2 {
+        println("FAIL want 2 kids")
+        bad = bad + 1
+    }
+    match resp.as_array(a, kids[0]) {
+        .ok(inner) => fake_nested_inner(c, a, kids, inner, bad)
+        .err(e) => {
+            println("FAIL inner as_array {e.kind}")
+            bad + 1
+        }
+    }
+}
+
+func fake_nested_inner(c: client.Client, a: resp.Arena, kids: [resp.Value], inner: [resp.Value], bad: int) -> int {
+    nb := bad
+    if inner.len() != 2 {
+        println("FAIL want 2 inner")
+        nb = bad + 1
+    }
+    match resp.as_str(a, inner[1]) {
+        .ok(s) => fake_nested_tail(c, a, kids, s, nb)
+        .err(e) => {
+            println("FAIL as_str {e.kind}")
+            nb + 1
+        }
+    }
+}
+
+func fake_nested_tail(c: client.Client, a: resp.Arena, kids: [resp.Value], s: str, bad: int) -> int {
+    nb := bad
+    if s != "b" {
+        println("FAIL want b got {s}")
+        nb = bad + 1
+    }
+    match resp.as_array(a, kids[1]) {
+        .ok(empty) => fake_nested_empty(c, empty, nb)
+        .err(e) => {
+            println("FAIL tail as_array {e.kind}")
+            nb + 1
+        }
+    }
+}
+
+func fake_nested_empty(c: client.Client, empty: [resp.Value], bad: int) -> int {
+    nb := bad
+    if empty.len() != 0 {
+        println("FAIL want empty tail")
+        nb = bad + 1
+    }
+    _u1 := client.close(c)
+    nb
+}
+
+@test
+func fake_error_reply_is_redis() {
+    port := fx_port(6)
+    _u9 := match fx_spawn(["fake", "{port}", "-ERR unknown command\r\n"]) {
+        .ok(ch) => fake_error_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// -ERR maps to kind redis (never retried, never IO).
+
+func fake_error_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_error_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_error_check(c: client.Client) -> int {
+    match client.exchange(c, ["FOO"], false, 0) {
+        .ok(_) => {
+            println("FAIL want error for FOO")
+            _u1 := client.close(c)
+            1
+        }
+        .err(e) => fake_error_kind(c, e)
+    }
+}
+
+func fake_error_kind(c: client.Client, e: errors.RError) -> int {
+    bad := 0
+    if e.kind != "redis" {
+        println("FAIL want redis got {e.kind}")
+        bad = bad + 1
+    }
+    if str.contains(e.detail, "unknown command") == false {
+        println("FAIL detail {e.detail}")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+@test
+func fake_oversized_bulk_fails_fast() {
+    port := fx_port(7)
+    _u9 := match fx_spawn(["fake", "{port}", "SEND_CLOSE:$67108865\r\n"]) {
+        .ok(ch) => fake_oversized_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// $67108865 (64MiB+1) then close: bulk_too_large with no hang, no alloc.
+
+func fake_oversized_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_oversized_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_oversized_check(c: client.Client) -> int {
+    match client.exchange(c, ["GET", "big"], true, 0) {
+        .ok(_) => {
+            println("FAIL want error for oversized bulk")
+            _u1 := client.close(c)
+            1
+        }
+        .err(e) => fake_oversized_kind(c, e)
+    }
+}
+
+func fake_oversized_kind(c: client.Client, e: errors.RError) -> int {
+    bad := 0
+    if e.kind != "protocol" {
+        println("FAIL want protocol got {e.kind}")
+        bad = bad + 1
+    }
+    if str.contains(e.detail, "bulk_too_large") == false {
+        println("FAIL detail {e.detail}")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+@test
+func fake_short_bulk_is_closed() {
+    port := fx_port(8)
+    _u9 := match fx_spawn(["fake", "{port}", "SEND_CLOSE:$5\r\nabc"]) {
+        .ok(ch) => fake_short_bulk_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// Declares 5, sends 3, closes: a short read is closed/timeout, never a
+// partial value.
+
+func fake_short_bulk_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_short_bulk_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_short_bulk_check(c: client.Client) -> int {
+    match client.exchange(c, ["GET", "k"], true, 0) {
+        .ok(_) => {
+            println("FAIL want error for short bulk")
+            _u1 := client.close(c)
+            1
+        }
+        .err(e) => fake_short_bulk_kind(c, e)
+    }
+}
+
+func fake_short_bulk_kind(c: client.Client, e: errors.RError) -> int {
+    bad := 0
+    if e.kind != "closed" && e.kind != "timeout" {
+        println("FAIL want closed/timeout got {e.kind}")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+@test
+func fake_short_crlf_is_closed() {
+    port := fx_port(9)
+    _u9 := match fx_spawn(["fake", "{port}", "CLOSE"]) {
+        .ok(ch) => fake_short_crlf_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// Truncated line framing: the server answers the PING with zero bytes and
+// closes. (A partial line plus EOF still completes: the transport returns
+// the bytes it has and the parser normalizes one line, so only a zero-byte
+// close fails the line read.) The read fails closed, never a half reply.
+
+func fake_short_crlf_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_short_crlf_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_short_crlf_check(c: client.Client) -> int {
+    match client.exchange(c, ["PING"], true, 0) {
+        .ok(_) => {
+            println("FAIL want error for short crlf")
+            _u1 := client.close(c)
+            1
+        }
+        .err(e) => fake_short_crlf_kind(c, e)
+    }
+}
+
+func fake_short_crlf_kind(c: client.Client, e: errors.RError) -> int {
+    bad := 0
+    if e.kind != "closed" && e.kind != "timeout" {
+        println("FAIL want closed/timeout got {e.kind}")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+@test
+func fake_resp3_map_parses() {
+    port := fx_port(10)
+    _u9 := match fx_spawn(["fake", "{port}", "%1\r\n$1\r\na\r\n$1\r\nb\r\n"]) {
+        .ok(ch) => fake_map_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func fake_map_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_map_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_map_check(c: client.Client) -> int {
+    match client.exchange(c, ["HELLO", "3"], true, 0) {
+        .ok(r) => fake_map_value(c, r)
+        .err(e) => {
+            println("FAIL exchange {e.kind} {e.detail}")
+            1
+        }
+    }
+}
+
+func fake_map_value(c: client.Client, r: conn.Reply) -> int {
+    bad := 0
+    if resp.tag_of(r.arena, conn.reply_value(r)) != resp.R_MAP {
+        println("FAIL want map tag")
+        bad = bad + 1
+    }
+    match resp.as_map(r.arena, conn.reply_value(r)) {
+        .ok(flat) => fake_map_flat(c, r.arena, flat, bad)
+        .err(e) => {
+            println("FAIL as_map {e.kind}")
+            bad + 1
+        }
+    }
+}
+
+func fake_map_flat(c: client.Client, a: resp.Arena, flat: [resp.Value], bad: int) -> int {
+    nb := bad
+    if flat.len() != 2 {
+        println("FAIL want 2 map entries")
+        nb = bad + 1
+    }
+    match resp.as_str(a, flat[0]) {
+        .ok(k) => fake_map_kv(c, a, flat, k, nb)
+        .err(e) => {
+            println("FAIL as_str {e.kind}")
+            nb + 1
+        }
+    }
+}
+
+func fake_map_kv(c: client.Client, a: resp.Arena, flat: [resp.Value], k: str, bad: int) -> int {
+    nb := bad
+    if k != "a" {
+        println("FAIL want key a got {k}")
+        nb = bad + 1
+    }
+    match resp.as_str(a, flat[1]) {
+        .ok(v) => fake_map_v(c, v, nb)
+        .err(e) => {
+            println("FAIL as_str {e.kind}")
+            nb + 1
+        }
+    }
+}
+
+func fake_map_v(c: client.Client, v: str, bad: int) -> int {
+    nb := bad
+    if v != "b" {
+        println("FAIL want value b got {v}")
+        nb = bad + 1
+    }
+    _u1 := client.close(c)
+    nb
+}
+
+@test
+func fake_resp3_set_bool_double() {
+    port := fx_port(11)
+    _u9 := match fx_spawn(["fake", "{port}", "~1\r\n+a\r\n", "#t\r\n", ",1.5\r\n"]) {
+        .ok(ch) => fake_sbd_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// One connection, three sequential commands: set, bool, double.
+
+func fake_sbd_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_sbd_set(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_sbd_set(c: client.Client) -> int {
+    match client.exchange(c, ["SMEMBERS", "s"], true, 0) {
+        .ok(r) => fake_sbd_set_value(c, r)
+        .err(e) => {
+            println("FAIL set exchange {e.kind} {e.detail}")
+            1
+        }
+    }
+}
+
+func fake_sbd_set_value(c: client.Client, r: conn.Reply) -> int {
+    bad := 0
+    if resp.tag_of(r.arena, conn.reply_value(r)) != resp.R_SET {
+        println("FAIL want set tag")
+        bad = bad + 1
+    }
+    match resp.as_array(r.arena, conn.reply_value(r)) {
+        .ok(kids) => fake_sbd_set_kids(c, r.arena, kids, bad)
+        .err(e) => {
+            println("FAIL as_array {e.kind}")
+            bad + 1
+        }
+    }
+}
+
+func fake_sbd_set_kids(c: client.Client, a: resp.Arena, kids: [resp.Value], bad: int) -> int {
+    nb := bad
+    if kids.len() != 1 {
+        println("FAIL want 1 member")
+        nb = bad + 1
+    }
+    match resp.as_str(a, kids[0]) {
+        .ok(s) => fake_sbd_set_next(c, s, nb)
+        .err(e) => {
+            println("FAIL as_str {e.kind}")
+            nb + 1
+        }
+    }
+}
+
+func fake_sbd_set_next(c: client.Client, s: str, bad: int) -> int {
+    nb := bad
+    if s != "a" {
+        println("FAIL want member a got {s}")
+        nb = bad + 1
+    }
+    nb + fake_sbd_bool(c)
+}
+
+func fake_sbd_bool(c: client.Client) -> int {
+    match client.exchange(c, ["GET", "b"], true, 0) {
+        .ok(r) => fake_sbd_bool_value(c, r)
+        .err(e) => {
+            println("FAIL bool exchange {e.kind} {e.detail}")
+            1
+        }
+    }
+}
+
+func fake_sbd_bool_value(c: client.Client, r: conn.Reply) -> int {
+    bad := 0
+    if resp.tag_of(r.arena, conn.reply_value(r)) != resp.R_BOOL {
+        println("FAIL want bool tag")
+        bad = bad + 1
+    }
+    match resp.as_int(r.arena, conn.reply_value(r)) {
+        .ok(n) => fake_sbd_bool_next(c, n, bad)
+        .err(e) => {
+            println("FAIL as_int {e.kind}")
+            bad + 1
+        }
+    }
+}
+
+func fake_sbd_bool_next(c: client.Client, n: int, bad: int) -> int {
+    nb := bad
+    if n != 1 {
+        println("FAIL want true(1) got {n}")
+        nb = bad + 1
+    }
+    nb + fake_sbd_double(c)
+}
+
+func fake_sbd_double(c: client.Client) -> int {
+    match client.exchange(c, ["GET", "d"], true, 0) {
+        .ok(r) => fake_sbd_double_value(c, r)
+        .err(e) => {
+            println("FAIL double exchange {e.kind} {e.detail}")
+            1
+        }
+    }
+}
+
+func fake_sbd_double_value(c: client.Client, r: conn.Reply) -> int {
+    bad := 0
+    if resp.tag_of(r.arena, conn.reply_value(r)) != resp.R_DOUBLE {
+        println("FAIL want double tag")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+@test
+func fake_push_outside_subscribe_is_protocol() {
+    port := fx_port(12)
+    _u9 := match fx_spawn(["fake", "{port}", ">2\r\n+hi\r\n+there\r\n"]) {
+        .ok(ch) => fake_push_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// RESP3 push on a plain connection: protocol unexpected_push, never a value.
+
+func fake_push_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_push_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_push_check(c: client.Client) -> int {
+    match client.exchange(c, ["PING"], true, 0) {
+        .ok(_) => {
+            println("FAIL want error for push")
+            _u1 := client.close(c)
+            1
+        }
+        .err(e) => fake_push_kind(c, e)
+    }
+}
+
+func fake_push_kind(c: client.Client, e: errors.RError) -> int {
+    bad := 0
+    if e.kind != "protocol" {
+        println("FAIL want protocol got {e.kind}")
+        bad = bad + 1
+    }
+    if str.contains(e.detail, "unexpected_push") == false {
+        println("FAIL detail {e.detail}")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+@test
+func fake_slow_loris_pong() {
+    port := fx_port(13)
+    _u9 := match fx_spawn(["fake", "{port}", "SPLIT:1:+PONG\r\n"]) {
+        .ok(ch) => fake_loris_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// +PONG one byte at a time: framing reassembles, reply stays exact.
+
+func fake_loris_run(port: int, ch: process) -> int {
+    bad := 0
+    if fx_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match fx_dial(port) {
+        .ok(c) => {
+            bad = bad + fake_loris_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := fx_reap(ch)
+    bad = fx_check_report(rep, "code=0", bad)
+    bad = fx_check_report(rep, "FSRVDONE", bad)
+    assert(bad == 0)
+    bad
+}
+
+func fake_loris_check(c: client.Client) -> int {
+    match client.exchange(c, ["PING"], true, 0) {
+        .ok(r) => fake_loris_value(c, r)
+        .err(e) => {
+            println("FAIL exchange {e.kind} {e.detail}")
+            1
+        }
+    }
+}
+
+func fake_loris_value(c: client.Client, r: conn.Reply) -> int {
+    match resp.as_str(r.arena, conn.reply_value(r)) {
+        .ok(s) => fake_loris_str(c, s)
+        .err(e) => {
+            println("FAIL as_str {e.kind}")
+            1
+        }
+    }
+}
+
+func fake_loris_str(c: client.Client, s: str) -> int {
+    bad := 0
+    if s != "PONG" {
+        println("FAIL want PONG got {s}")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}

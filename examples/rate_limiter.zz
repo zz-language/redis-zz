@@ -1,0 +1,32 @@
+import redis
+import redis.conn as conn
+import redis.resp as resp
+
+func allow(c: redis.Client, key: str, limit: int, window_s: int) -> Result<bool, redis.RError> {
+    out := redis.pipe(c, [["INCR", key], ["EXPIRE", key, "{window_s}", "NX"]])?
+    first := out.replies[0]
+    match resp.as_int(first.arena, conn.reply_value(first)) {
+        .ok(n) => .ok(n <= limit)
+        .err(e) => .err(e)
+    }
+}
+
+func run_attempts(c: redis.Client, n: int) -> Result<int, redis.RError> {
+    i := n
+    while i <= 7 {
+        a := allow(c, "zz:ex:ratelimit", 5, 60)?
+        println("attempt={i} allowed={a}")
+        i = i + 1
+    }
+    .ok(i)
+}
+
+func main() -> Result<int, redis.RError> {
+    c := redis.connect("redis://127.0.0.1:6379")?
+    _u1 := c.del(["zz:ex:ratelimit"])?
+    _u2 := run_attempts(c, 1)?
+    _u3 := c.del(["zz:ex:ratelimit"])?
+    _u4 := c.close()
+    println("ratelimiter_ok")
+    .ok(0)
+}

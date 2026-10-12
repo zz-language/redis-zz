@@ -1,0 +1,466 @@
+// conn.zz — one connection: handshake, request/reply, reconnect (plan v3 §8).
+//
+// Handshake order per new connection: open transport → HELLO/AUTH →
+// SELECT → CLIENT SETINFO (fire-and-forget reads, errors ignored) → Ready.
+// Auth rejection is Auth (never retried). Every reconnect re-runs the full
+// handshake so db/auth/name are restored.
+//
+// Replies are read incrementally: one line, then bulk bodies by declared
+// length, then aggregates element-by-element (bounded by Limits depth).
+// A short read is a timeout/closed error, never a partial value. After a
+// Protocol error the connection is poisoned (poisoned=true) and must be
+// closed, never reused — the stream position is untrustworthy.
+import std.bytes
+import std.str
+
+import redis.errors as errors
+import redis.resp as resp
+import redis.transport as transport
+import redis.url as url
+
+pub struct Conn {
+    t: transport.Transport,
+    db: int,
+    user: str,
+    pass: str,
+    name: str,
+    proto: int,
+}
+
+// A complete reply with its arena (arena travels with the root).
+pub struct Reply {
+    arena: resp.Arena,
+    id: int,
+}
+
+pub func reply_value(r: Reply) -> resp.Value {
+    resp.Value{id: r.id}
+}
+
+// Read one CRLF line as ints (parser input unit). Toolchain read_line
+// strips `\n` but may keep `\r`; normalize so exactly one CRLF feeds
+// the parser on both engines.
+func read_line_ints(t: transport.Transport) -> Result<[int], errors.RError> {
+    match transport.read_line(t) {
+        .ok(s) => {
+            line := s
+            bs := str.bytes(line)
+            if bs.len() > 0 && bs[bs.len() - 1] == 13 {
+                line = line[0:line.len() - 1]
+            }
+            .ok(str.bytes("{line}\r\n"))
+        }
+        .err(e) => .err(e)
+    }
+}
+
+// Read one full reply value (top-level depth 0).
+pub func read_reply(t: transport.Transport, lim: resp.Limits) -> Result<Reply, errors.RError> {
+    a := resp.new_arena()
+    match read_value(t, a, 0, lim) {
+        .ok(o) => .ok(Reply{arena: o.arena, id: o.id})
+        .err(e) => .err(e)
+    }
+}
+
+// Read one value at the given nesting depth.
+func read_value(t: transport.Transport, a: resp.Arena, depth: int, lim: resp.Limits) -> Result<resp.ParseOut, errors.RError> {
+    if depth > lim.max_depth {
+        return .err(errors.protocol_error("max_depth {depth}"))
+    }
+    line := read_line_ints(t)?
+    if line.len() == 0 {
+        return .err(errors.protocol_error("empty_reply"))
+    }
+    prefix := line[0]
+    // Bulk/string bodies need exact byte reads; aggregates recurse.
+    if prefix == 36 {
+        return read_bulk(t, a, line, lim)
+    }
+    if prefix == 42 {
+        return read_array(t, a, line, depth, lim, resp.R_ARRAY)
+    }
+    if prefix == 37 {
+        return read_pairs(t, a, line, depth, lim, resp.R_MAP)
+    }
+    if prefix == 126 {
+        return read_array(t, a, line, depth, lim, resp.R_SET)
+    }
+    if prefix == 124 {
+        return read_pairs(t, a, line, depth, lim, resp.R_ATTR)
+    }
+    if prefix == 62 {
+        return read_array(t, a, line, depth, lim, resp.R_PUSH)
+    }
+    if prefix == 61 {
+        return read_verbatim(t, a, line, lim)
+    }
+    // Simple/int/error/bool/double/big/null-all fit on one line: parse
+    // the line buffer directly (the parser owns CRLF checks).
+    match resp.parse(a, line, 0, depth, lim) {
+        .ok(o) => {
+            if o.next != line.len() {
+                return .err(errors.protocol_error("trailing_bytes {o.next}/{line.len()}"))
+            }
+            .ok(o)
+        }
+        .err(e) => .err(e)
+    }
+}
+
+// Bulk string: $len line already in hand; read len+2 more bytes.
+// $-1 is null: no body follows, parse the header alone.
+func read_bulk(t: transport.Transport, a: resp.Arena, line: [int], lim: resp.Limits) -> Result<resp.ParseOut, errors.RError> {
+    // `line` already ends in CRLF (read_line_ints); append the body so
+    // the parser sees header+body as one buffer.
+    need := bulk_need(line, lim)?
+    if need < 0 {
+        match resp.parse(a, line, 0, 0, lim) {
+            .ok(o) => {
+                return .ok(o)
+            }
+            .err(e) => return .err(e)
+        }
+    }
+    match transport.read_exact(t, need) {
+        .ok(body) => {
+            buf := extend(line, bytes.to_ints(body))
+            match resp.parse(a, buf, 0, 0, lim) {
+                .ok(o) => .ok(o)
+                .err(e) => .err(e)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+// Declared body length for a $ header line (validates, enforces max_bulk).
+func bulk_need(line: [int], lim: resp.Limits) -> Result<int, errors.RError> {
+    // line is "$<n>\r\n" as ints; parse the integer between.
+    digits := line[1:line.len() - 2]
+    n := 0
+    neg := false
+    if digits.len() > 0 && digits[0] == 45 {
+        neg = true
+        digits = digits[1:]
+    }
+    for d in digits {
+        if d < 48 || d > 57 {
+            return .err(errors.protocol_error("bad_length"))
+        }
+        n = n * 10 + (d - 48)
+        if n > lim.max_bulk + 8 {
+            return .err(errors.protocol_error("bulk_too_large {n}"))
+        }
+    }
+    if neg {
+        if n != 1 {
+            return .err(errors.protocol_error("bad_length -{n}"))
+        }
+        return .ok(-1)
+    }
+    if n > lim.max_bulk {
+        return .err(errors.protocol_error("bulk_too_large {n}"))
+    }
+    .ok(n + 2)
+}
+
+// Aggregate with n elements (array/set/push).
+func read_array(t: transport.Transport, a: resp.Arena, line: [int], depth: int, lim: resp.Limits, tag: int) -> Result<resp.ParseOut, errors.RError> {
+    n := array_len(line, lim)?
+    if n < 0 {
+        return resp.parse(a, line, 0, depth, lim)
+    }
+    kids: [int] = []
+    arena := a
+    i := 0
+    while i < n {
+        match read_value(t, arena, depth + 1, lim) {
+            .ok(o) => {
+                arena = o.arena
+                kids = kids.push(o.id)
+            }
+            .err(e) => return .err(e)
+        }
+        i = i + 1
+    }
+    .ok(alloc_array(arena, tag, kids))
+}
+
+// Map/attr: n pairs (2n elements, flat k,v,k,v).
+func read_pairs(t: transport.Transport, a: resp.Arena, line: [int], depth: int, lim: resp.Limits, tag: int) -> Result<resp.ParseOut, errors.RError> {
+    n := array_len(line, lim)?
+    if n < 0 {
+        return resp.parse(a, line, 0, depth, lim)
+    }
+    kids: [int] = []
+    arena := a
+    i := 0
+    while i < n * 2 {
+        match read_value(t, arena, depth + 1, lim) {
+            .ok(o) => {
+                arena = o.arena
+                kids = kids.push(o.id)
+            }
+            .err(e) => return .err(e)
+        }
+        i = i + 1
+    }
+    .ok(alloc_array(arena, tag, kids))
+}
+
+// Verbatim string: =len line, then ext(4, "txt:") + content.
+func read_verbatim(t: transport.Transport, a: resp.Arena, line: [int], lim: resp.Limits) -> Result<resp.ParseOut, errors.RError> {
+    need := bulk_need(line, lim)?
+    if need < 0 {
+        return .err(errors.protocol_error("bad_length verbatim_null"))
+    }
+    match transport.read_exact(t, need) {
+        .ok(body) => {
+            buf := extend(line, bytes.to_ints(body))
+            match resp.parse(a, buf, 0, 0, lim) {
+                .ok(o) => .ok(o)
+                .err(e) => .err(e)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+// Declared element count for a * / % / ~ / | / > header line.
+func array_len(line: [int], lim: resp.Limits) -> Result<int, errors.RError> {
+    digits := line[1:line.len() - 2]
+    n := 0
+    neg := false
+    if digits.len() > 0 && digits[0] == 45 {
+        neg = true
+        digits = digits[1:]
+    }
+    for d in digits {
+        if d < 48 || d > 57 {
+            return .err(errors.protocol_error("bad_length"))
+        }
+        n = n * 10 + (d - 48)
+        if n > lim.max_array + 8 {
+            return .err(errors.protocol_error("array_too_large {n}"))
+        }
+    }
+    if neg {
+        if n != 1 {
+            return .err(errors.protocol_error("bad_length -{n}"))
+        }
+        return .ok(-1)
+    }
+    if n > lim.max_array {
+        return .err(errors.protocol_error("array_too_large {n}"))
+    }
+    .ok(n)
+}
+
+// Allocate an aggregate node directly (children already parsed).
+func alloc_array(a: resp.Arena, tag: int, kids: [int]) -> resp.ParseOut {
+    // NOTE: depends on resp Arena layout (parallel arrays + kids/starts/
+// lens). If resp internals shift, prefer a resp.append helper instead.
+    // This keeps conn parsing exact without re-serializing.
+    start := a.kids.len()
+    arena := a
+    arena.kids = extend(arena.kids, kids)
+    id := arena.tags.len()
+    arena.tags = arena.tags.push(tag)
+    arena.strs = arena.strs.push("")
+    arena.ints = arena.ints.push(0)
+    arena.raws = arena.raws.push([])
+    arena.starts = arena.starts.push(start)
+    arena.lens = arena.lens.push(kids.len())
+    resp.ParseOut{arena: arena, id: id, next: 0}
+}
+
+func extend(xs: [int], ys: [int]) -> [int] {
+    out := xs
+    for y in ys {
+        out = out.push(y)
+    }
+    out
+}
+
+// Send argv (no reply read). A write error may mean the peer died
+// mid-frame; callers treat it as sent (see client.zz policy).
+pub func send(c: Conn, args: [str]) -> Result<int, errors.RError> {
+    send_frame(c, resp.encode(args))
+}
+
+// Send a pre-encoded frame (binary path; same sent-honesty as send).
+pub func send_frame(c: Conn, frame: bytes) -> Result<int, errors.RError> {
+    transport.write(c.t, frame)
+}
+
+// Read one reply (no retry here — policy lives in client.zz).
+pub func recv(c: Conn) -> Result<Reply, errors.RError> {
+    read_reply(c.t, resp.default_limits())
+}
+
+// Send argv, read one reply (handshake + simple call sites; no retry).
+pub func call(c: Conn, args: [str]) -> Result<Reply, errors.RError> {
+    send(c, args)?
+    recv(c)
+}
+
+// Map an R_ERROR reply node to the taxonomy (called by client/cmds after
+// call; handshake uses handshake_step for auth-specific mapping).
+pub func reply_error(a: resp.Arena, id: int) -> errors.RError {
+    match resp.err_text(a, resp.Value{id: id}) {
+        .ok(text) => classify_server_error(text)
+        .err(_) => errors.protocol_error("unreadable_error")
+    }
+}
+
+func classify_server_error(text: str) -> errors.RError {
+    code := text
+    msg := ""
+    sp := str.find(text, " ", 0)
+    if sp >= 0 {
+        code = text[0:sp]
+        msg = text[sp + 1:]
+    }
+    if code == "MOVED" {
+        return errors.moved_error(parse_slot(msg), parse_addr(msg))
+    }
+    if code == "ASK" {
+        return errors.ask_error(parse_slot(msg), parse_addr(msg))
+    }
+    if code == "WRONGTYPE" || code == "OOM" || code == "BUSY" || code == "LOADING" || code == "READONLY" || code == "NOSCRIPT" || code == "ERR" {
+        return errors.redis_error(code, msg)
+    }
+    errors.redis_error(code, msg)
+}
+
+func parse_slot(msg: str) -> int {
+    parts := str.split(msg, " ")
+    if parts.len() > 0 {
+        return int(parts[0]) ?? -1
+    }
+    -1
+}
+
+func parse_addr(msg: str) -> str {
+    parts := str.split(msg, " ")
+    if parts.len() > 1 {
+        return parts[1]
+    }
+    ""
+}
+
+// Dial + handshake (plan §8). Returns a Ready connection.
+pub func dial(o: url.Options) -> Result<Conn, errors.RError> {
+    match transport.open(o) {
+        .ok(t) => {
+            c := Conn{t: t, db: o.db, user: o.user, pass: o.pass, name: o.name, proto: o.proto}
+            match handshake(c) {
+                .ok(_) => .ok(c)
+                .err(e) => {
+                    transport.close(t)
+                    .err(e)
+                }
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+func handshake(c: Conn) -> Result<int, errors.RError> {
+    // HELLO when proto=3 or credentials are set; RESP2 AUTH fallback on
+    // unknown-command; SELECT when db != 0; SETINFO best-effort.
+    use_hello := c.proto == 3 || c.pass != "" || c.user != ""
+    if use_hello {
+        args := ["HELLO", "3"]
+        if c.pass != "" {
+            args = extend_str(args, ["AUTH", c.user, c.pass])
+        } else if c.user != "" {
+            args = extend_str(args, ["AUTH", c.user, ""])
+        }
+        if c.name != "" {
+            args = extend_str(args, ["SETNAME", c.name])
+        }
+        match call(c, args) {
+            .ok(r) => {
+                if resp.tag_of(r.arena, reply_value(r)) == resp.R_ERROR {
+                    match resp.err_text(r.arena, reply_value(r)) {
+                        .ok(t) => {
+                            if str.contains(t, "unknown") || str.contains(t, "wrong number") {
+                                return handshake_resp2(c)
+                            } else {
+                                return handshake_auth_error(t)
+                            }
+                        }
+                        .err(_) => return .err(errors.protocol_error("unreadable_hello"))
+                    }
+                }
+            }
+            .err(e) => return .err(e)
+        }
+    } else if c.pass != "" {
+        return handshake_auth(c, c.user, c.pass)
+    }
+    if c.db != 0 {
+        match call(c, ["SELECT", "{c.db}"]) {
+            .ok(r) => {
+                if resp.tag_of(r.arena, reply_value(r)) == resp.R_ERROR {
+                    match resp.err_text(r.arena, reply_value(r)) {
+                        .ok(t) => return .err(errors.redis_error("SELECT", t))
+                        .err(_) => return .err(errors.protocol_error("unreadable_select"))
+                    }
+                }
+            }
+            .err(e) => return .err(e)
+        }
+    }
+    // SETINFO is best-effort (Redis >= 7.2): replies consumed, errors ignored.
+    _u3 := match call(c, ["CLIENT", "SETINFO", "LIB-NAME", "redis-zz"]) {
+        .ok(_) => 0
+        .err(_) => 0
+    }
+    _u4 := match call(c, ["CLIENT", "SETINFO", "LIB-VER", "0.1.0"]) {
+        .ok(_) => 0
+        .err(_) => 0
+    }
+    .ok(0)
+}
+
+// RESP2 fallback: AUTH [user] pass.
+func handshake_resp2(c: Conn) -> Result<int, errors.RError> {
+    if c.pass != "" {
+        return handshake_auth(c, c.user, c.pass)
+    }
+    .ok(0)
+}
+
+func handshake_auth(c: Conn, user: str, pass: str) -> Result<int, errors.RError> {
+    args := ["AUTH", pass]
+    if user != "" {
+        args = ["AUTH", user, pass]
+    }
+    match call(c, args) {
+        .ok(r) => {
+            if resp.tag_of(r.arena, reply_value(r)) == resp.R_ERROR {
+                match resp.err_text(r.arena, reply_value(r)) {
+                    .ok(t) => return handshake_auth_error(t)
+                    .err(_) => return .err(errors.protocol_error("unreadable_auth"))
+                }
+            }
+            .ok(0)
+        }
+        .err(e) => .err(e)
+    }
+}
+
+func handshake_auth_error(t: str) -> Result<int, errors.RError> {
+    .err(errors.auth_error(t))
+}
+
+func extend_str(xs: [str], ys: [str]) -> [str] {
+    out := xs
+    for y in ys {
+        out = out.push(y)
+    }
+    out
+}

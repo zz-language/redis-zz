@@ -1,0 +1,178 @@
+// errors.zz — redis client error taxonomy (plan v3 §10.1).
+//
+// Every error is an RError value built by one constructor per kind. No
+// panics on any path: fallible operations return Result<T, RError> and
+// callers surface failures with `.err(...)`.
+//
+// Conventions:
+// - `kind` is stable API: "url" | "conn_refused" | "timeout" | "closed" |
+//   "protocol" | "redis" | "moved" | "ask" | "auth" | "tls" | "conflict" |
+//   "ambiguous" | "pool_exhausted". Match on it.
+// - `detail` carries machine-readable context (segment, phase, slot,
+//   server code...). It NEVER carries secrets: constructors take no
+//   password arguments, and `message()` output is safe to log.
+// - `hint` names the fix for the most likely cause.
+
+// One error value for the whole client. Cheap to copy, safe to log.
+pub struct RError {
+    kind: str,
+    detail: str,
+    hint: str,
+}
+
+// Render an error for logs/hooks: "{kind}({detail}): {hint}".
+// Never contains passwords (no constructor accepts one).
+
+pub func message(e: RError) -> str {
+    "{e.kind}({e.detail}): {e.hint}"
+}
+
+// True for transport-level IO failures worth retrying under the idempotent
+// policy (plan §10.2): conn_refused/timeout/closed/tls. False for
+// auth/protocol/url/redis — retrying those cannot help.
+
+pub func is_io(e: RError) -> bool {
+    e.kind == "conn_refused" || e.kind == "timeout" || e.kind == "closed" || e.kind == "tls"
+}
+
+// URL parse failure. `segment` names the bad part (unsupported_scheme,
+// missing_host, bad_port, db_out_of_range, unknown_param, empty_password,
+// bad_password, bad_query, bad_userinfo, bad_host, missing_path,
+// fragment); `detail` adds context. The hint names the fix per segment.
+
+pub func url_error(segment: str, detail: str) -> RError {
+    d := segment
+    if detail != "" {
+        d = "{segment} {detail}"
+    }
+    hint := "check the URL against the redis:// format: redis://[user[:pass]@]host[:port][/db][?params]"
+    if segment == "unsupported_scheme" {
+        hint = "use redis://host:port, rediss://host:port (TLS), or redis+unix:///path/to.sock"
+    } else if segment == "missing_host" {
+        hint = "add a host, e.g. redis://localhost:6379"
+    } else if segment == "bad_port" {
+        hint = "port must be an integer 1-65535, e.g. redis://localhost:6379"
+    } else if segment == "bad_host" {
+        hint = "IPv6 must be bracketed: redis://[::1]:6379; hostnames must not contain ':'"
+    } else if segment == "db_out_of_range" {
+        hint = "db must be 0-15, e.g. redis://localhost:6379/0 or ?db=1"
+    } else if segment == "unknown_param" {
+        hint = "use a supported query param: timeout_ms, connect_timeout_ms, pool, retries, proto, name, db, tls_ca, tls_insecure, tls_sni"
+    } else if segment == "empty_password" {
+        hint = "remove the colon for no-auth (user@host) or set a non-empty password"
+    } else if segment == "bad_password" {
+        hint = "percent-encode special chars in the password (%XX); '+' stays literal"
+    } else if segment == "bad_query" {
+        hint = "query params are key=value pairs joined by '&', e.g. ?pool=8&retries=3"
+    } else if segment == "bad_userinfo" {
+        hint = "use user[:pass]@host and percent-encode special chars"
+    } else if segment == "missing_path" {
+        hint = "give the socket path, e.g. redis+unix:///tmp/redis.sock?db=1"
+    } else if segment == "fragment" {
+        hint = "remove the #fragment; fragments are not allowed in redis URLs"
+    }
+    RError{kind: "url", detail: d, hint: hint}
+}
+
+// Dial failed: nothing listening at `addr` ("host:port").
+
+pub func conn_refused_error(addr: str) -> RError {
+    RError{kind: "conn_refused", detail: addr, hint: "connection refused at {addr}: start redis-server and check host:port/firewall"}
+}
+
+// A deadline fired. `phase` is connect|write|read|handshake.
+
+pub func timeout_error(phase: str) -> RError {
+    hint := "raise the matching timeout (connect_timeout_ms / timeout_ms) or set a per-command override"
+    if phase == "connect" {
+        hint = "connect timed out: raise connect_timeout_ms or check the server is reachable"
+    } else if phase == "handshake" {
+        hint = "handshake timed out: raise connect_timeout_ms; the server stalled mid-handshake"
+    } else if phase == "read" {
+        hint = "read timed out: raise timeout_ms, or set a per-command override for slow/blocking commands"
+    } else if phase == "write" {
+        hint = "write timed out: raise timeout_ms or shrink the payload (pipeline instead of one huge arg)"
+    }
+    RError{kind: "timeout", detail: phase, hint: hint}
+}
+
+// The connection broke. `during` is idle|command|pipeline|subscribe.
+// The connection is discarded; the next call redials.
+
+pub func closed_error(during: str) -> RError {
+    RError{kind: "closed", detail: during, hint: "connection closed during {during}: reconnect and retry only if the command is idempotent"}
+}
+
+// The server sent bytes outside the RESP grammar. `reason` names the
+// violation; the caller appends the byte offset to `detail`.
+// The connection is poisoned and closed, never reused.
+
+pub func protocol_error(reason: str) -> RError {
+    RError{kind: "protocol", detail: reason, hint: "protocol violation: the connection was closed, reconnect; if it repeats the peer is not Redis"}
+}
+
+// The server answered `-CODE message`. `code` is WRONGTYPE/OOM/BUSY/
+// LOADING/READONLY/NOSCRIPT/... Never auto-retried.
+
+pub func redis_error(code: str, msg: str) -> RError {
+    hint := "server-side failure ({code}): fix the command or data, retrying rarely helps"
+    if code == "OOM" {
+        hint = "OOM: free memory, raise maxmemory, or add a TTL/eviction policy"
+    } else if code == "READONLY" {
+        hint = "READONLY: send writes to the primary, reads may stay on the replica"
+    } else if code == "LOADING" {
+        hint = "LOADING: the dataset is still loading, wait and retry later"
+    } else if code == "BUSY" {
+        hint = "BUSY: a script is running, kill it with SCRIPT KILL or wait"
+    } else if code == "NOSCRIPT" {
+        hint = "NOSCRIPT: resend the script body with EVAL, then cache the SHA"
+    } else if code == "WRONGTYPE" {
+        hint = "WRONGTYPE: the key holds a different type, use the matching command or DEL it first"
+    }
+    RError{kind: "redis", detail: "{code}: {msg}", hint: hint}
+}
+
+// Slot `slot` moved permanently to `addr` ("host:port"). Typed now,
+// cluster routing follows in v2.
+
+pub func moved_error(slot: int, addr: str) -> RError {
+    RError{kind: "moved", detail: "{slot} {addr}", hint: "slot {slot} moved to {addr}: resend the command there (cluster routing lands in v2)"}
+}
+
+// Slot `slot` is migrating to `addr`: retry once there with ASKING.
+
+pub func ask_error(slot: int, addr: str) -> RError {
+    RError{kind: "ask", detail: "{slot} {addr}", hint: "slot {slot} is migrating to {addr}: retry once there with ASKING (cluster routing lands in v2)"}
+}
+
+// Auth rejected (wrong user/password, ACL denied). Never retried.
+
+pub func auth_error(reason: str) -> RError {
+    RError{kind: "auth", detail: reason, hint: "auth failed: check user/password (ACL) and URL-encoding; auth failures are never retried"}
+}
+
+// TLS failure. `reason` is handshake_failed|cert_untrusted|cert_hostname|
+// refused_tls|timeout|unsupported_in_this_build.
+
+pub func tls_error(reason: str) -> RError {
+    RError{kind: "tls", detail: reason, hint: "TLS failed ({reason}): check ca_file/hostname, confirm the server speaks TLS; no plaintext fallback"}
+}
+
+// WATCH tripped (EXEC returned nil). Re-run via @retryable.
+
+pub func conflict_error() -> RError {
+    RError{kind: "conflict", detail: "watch_conflict", hint: "WATCH tripped: re-read the keys and retry the whole transaction"}
+}
+
+// Bytes were sent but no usable reply arrived: the outcome is unknown.
+// NOT auto-retried; the caller must verify before resending.
+
+pub func ambiguous_error(cmd: str) -> RError {
+    RError{kind: "ambiguous", detail: cmd, hint: "{cmd} may or may not have applied: verify state before resending, never blind-retry"}
+}
+
+// Pool checkout waited `waited_ms` with no free connection.
+
+pub func pool_error(waited_ms: int) -> RError {
+    RError{kind: "pool_exhausted", detail: "{waited_ms}ms", hint: "pool exhausted after {waited_ms}ms: raise pool=, lower concurrency, or shorten checkout holds"}
+}

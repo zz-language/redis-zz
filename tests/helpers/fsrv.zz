@@ -1,0 +1,716 @@
+// fsrv.zz — scripted RESP server child for the redis-zz fake/chaos suites.
+//
+// Runs as its own OS process (`zz run tests/helpers/fsrv.zz MODE PORT ...`),
+// so no green-task concurrency is involved on either side: the parent test
+// drives the real redis client single-threaded while this process answers
+// from scripted specs. Deterministic where in-process task servers flaked
+// (interpreter shell-pool race under concurrent net IO).
+//
+// Usage: fsrv MODE PORT [extra...]
+//   fake PORT SPEC...        handshake + one command per SPEC, then exit
+//   c4 PORT                  expect one AUTH-bearing frame, reject WRONGPASS
+//   c7 PORT                  handshake + one frame, count, close unanswered
+//   c8 PORT                  two sessions: drop a GET, then serve it ("foo")
+//   c9 PORT CODE MSG          handshake + one frame, reply -CODE MSG
+//   c10 PORT                 two sessions: stall mid-bulk, then serve +OK
+//
+// Reply SPEC directives (fake mode): a plain RESP payload is written
+// verbatim, "SEND_CLOSE:<payload>" writes then closes (short reads),
+// "SPLIT:n:<payload>" drip-feeds n bytes at a time with 5ms sleeps, and
+// "CLOSE" closes without replying.
+//
+// Readiness: the parent polls a raw connect first; that probe connects and
+// closes with no bytes, which surfaces here as a first-read EOF. Up to 3
+// such empty sessions are tolerated (not counted); the first framed
+// session is the real one. Every accepted socket has an 8s read deadline
+// and total accepts are capped, so a dead parent can never hang this
+// process past ~10s: it always exits 0 (served) or 1 (internal failure).
+// Machine-checkable lines go to stdout ("FSRVDONE ...", "AUTH_HITS=n",
+// ...); the parent asserts on them after wait().
+import std.bytes
+import std.env
+import std.net
+import std.str
+import std.time
+
+func main() -> Result<int, str> {
+    args := env.args()
+    if args.len() < 2 {
+        println("FSRVFAIL usage: fsrv MODE PORT [extra...]")
+        return .ok(1)
+    }
+    mode := args[0]
+    port := args[1]
+    if mode == "fake" {
+        return srv_fake(port, args)
+    }
+    if mode == "c4" {
+        return srv_c4(port)
+    }
+    if mode == "c7" {
+        return srv_c7(port)
+    }
+    if mode == "c8" {
+        return srv_c8(port)
+    }
+    if mode == "c9" {
+        return srv_c9(port, args)
+    }
+    if mode == "c10" {
+        return srv_c10(port)
+    }
+    println("FSRVFAIL unknown mode {mode}")
+    .ok(1)
+}
+
+// ---- Generic framing helpers ----
+
+func srv_listen(port: str) -> Result<tcp.listener, str> {
+    net.tcp_listen("127.0.0.1:{port}")
+}
+
+func srv_stripcr(s: str) -> str {
+    if s.len() > 0 && s[s.len() - 1:] == "\r" {
+        return s[0:s.len() - 1]
+    }
+    s
+}
+
+func srv_read_line(s: tcp.stream) -> Result<str, str> {
+    match s.read_line() {
+        .ok(l) => .ok(srv_stripcr(l))
+        .err(e) => .err(e)
+    }
+}
+
+func srv_arm_timeouts(s: tcp.stream) -> int {
+    _u1 := s.set_read_timeout(8000)
+    _u2 := s.set_write_timeout(8000)
+    0
+}
+
+// Read one argv frame as strings (binary-safe discard would do for counting,
+// but c4/c7 assert on content, so decode; undecodable args become "").
+
+func srv_read_argv(s: tcp.stream) -> Result<[str], str> {
+    match srv_read_line(s) {
+        .err(e) => .err(e)
+        .ok(hdr) => srv_read_n(s, hdr)
+    }
+}
+
+func srv_read_n(s: tcp.stream, hdr: str) -> Result<[str], str> {
+    if hdr.len() == 0 {
+        return .err("empty header")
+    }
+    n := int(hdr[1:]) ?? -1
+    if n < 0 {
+        return .err("bad array header")
+    }
+    srv_read_args(s, n, [])
+}
+
+func srv_read_args(s: tcp.stream, n: int, acc: [str]) -> Result<[str], str> {
+    if acc.len() >= n {
+        return .ok(acc)
+    }
+    match srv_read_line(s) {
+        .err(e) => .err(e)
+        .ok(dhdr) => srv_read_one(s, n, acc, dhdr)
+    }
+}
+
+func srv_read_one(s: tcp.stream, n: int, acc: [str], dhdr: str) -> Result<[str], str> {
+    blen := int(dhdr[1:]) ?? -1
+    if blen < 0 {
+        return .err("bad bulk header")
+    }
+    match s.read_exact(blen + 2) {
+        .err(e) => .err(e)
+        .ok(body) => srv_read_body(s, n, acc, body, blen)
+    }
+}
+
+func srv_read_body(s: tcp.stream, n: int, acc: [str], body: bytes, blen: int) -> Result<[str], str> {
+    ints := bytes.to_ints(body)
+    content := ints[0:blen]
+    text := bytes.to_str(content) ?? ""
+    srv_read_args(s, n, acc.push(text))
+}
+
+func srv_min(a: int, b: int) -> int {
+    if a < b {
+        return a
+    }
+    b
+}
+
+func srv_max1(n: int) -> int {
+    if n < 1 {
+        return 1
+    }
+    n
+}
+
+func srv_write_plain(s: tcp.stream, payload: str) -> int {
+    match s.write(payload) {
+        .ok(n) => n
+        .err(_) => 0 - 1
+    }
+}
+
+func srv_write_split(s: tcp.stream, payload: str, n: int) -> int {
+    bs := str.bytes(payload)
+    srv_write_chunks(s, bs, srv_max1(n), 0)
+}
+
+func srv_write_chunks(s: tcp.stream, bs: [int], n: int, off: int) -> int {
+    if off >= bs.len() {
+        return off
+    }
+    end := srv_min(off + n, bs.len())
+    match bytes.finish(bs[off:end]) {
+        .err(_) => 0 - 1
+        .ok(b) => srv_write_chunk(s, bs, n, end, b)
+    }
+}
+
+func srv_write_chunk(s: tcp.stream, bs: [int], n: int, end: int, b: bytes) -> int {
+    match s.write_bytes(b) {
+        .err(_) => 0 - 1
+        .ok(_) => srv_sleep_next(s, bs, n, end)
+    }
+}
+
+func srv_sleep_next(s: tcp.stream, bs: [int], n: int, end: int) -> int {
+    time.sleep_ms(5)
+    srv_write_chunks(s, bs, n, end)
+}
+
+// Serve one SPEC, returning 1 when the session is over (closed), else 0.
+
+func srv_serve_spec(s: tcp.stream, spec: str) -> int {
+    if spec == "CLOSE" {
+        _u3 := s.close()
+        return 1
+    }
+    srv_serve_maybe(s, spec)
+}
+
+func srv_serve_maybe(s: tcp.stream, spec: str) -> int {
+    if spec.len() > 6 {
+        return srv_serve_prefixed(s, spec)
+    }
+    srv_write_plain(s, spec)
+}
+
+func srv_serve_prefixed(s: tcp.stream, spec: str) -> int {
+    if spec[0:6] == "SPLIT:" {
+        return srv_serve_split(s, spec)
+    }
+    srv_serve_send_close_maybe(s, spec)
+}
+
+func srv_serve_send_close_maybe(s: tcp.stream, spec: str) -> int {
+    if spec.len() > 11 {
+        return srv_serve_send_close_check(s, spec)
+    }
+    srv_write_plain(s, spec)
+}
+
+func srv_serve_send_close_check(s: tcp.stream, spec: str) -> int {
+    if spec[0:11] == "SEND_CLOSE:" {
+        return srv_send_close(s, spec[11:])
+    }
+    srv_write_plain(s, spec)
+}
+
+func srv_send_close(s: tcp.stream, payload: str) -> int {
+    _u4 := srv_write_plain(s, payload)
+    _u5 := s.close()
+    1
+}
+
+func srv_serve_split(s: tcp.stream, spec: str) -> int {
+    second := str.find(spec, ":", 6)
+    srv_serve_split_at(s, spec, second)
+}
+
+func srv_serve_split_at(s: tcp.stream, spec: str, second: int) -> int {
+    if second < 0 {
+        return srv_write_plain(s, spec)
+    }
+    n := int(spec[6:second]) ?? 1
+    srv_write_split(s, spec[second + 1:], n)
+}
+
+// Second handshake frame (SETINFO#2): read it, answer +OK. The first frame
+// is answered by the caller (it was already consumed to tell probes from
+// real sessions). Returns "ok" or a fail tag; the socket stays open.
+
+func srv_handshake2(s: tcp.stream) -> str {
+    match srv_read_argv(s) {
+        .err(_) => "hs2_fail"
+        .ok(_) => srv_handshake_done(s)
+    }
+}
+
+func srv_handshake_done(s: tcp.stream) -> str {
+    _u7 := s.write("+OK\r\n")
+    "ok"
+}
+
+func srv_close(s: tcp.stream) -> int {
+    _u8 := s.close()
+    0
+}
+
+// ---- Modes ----
+
+// fake: handshake + one command per SPEC. Exits after the first framed
+// session (empty probe sessions are skipped, up to 6 accepts).
+
+func srv_fake(port: str, args: [str]) -> Result<int, str> {
+    match srv_listen(port) {
+        .err(e) => {
+            println("FSRVFAIL listen {e}")
+            .ok(1)
+        }
+        .ok(l) => srv_fake_loop(l, args[2:], 0)
+    }
+}
+
+func srv_fake_loop(l: tcp.listener, specs: [str], accepts: int) -> Result<int, str> {
+    if accepts >= 6 {
+        println("FSRVFAIL too many accepts")
+        return .ok(1)
+    }
+    match l.accept() {
+        .err(e) => {
+            println("FSRVFAIL accept {e}")
+            .ok(1)
+        }
+        .ok(ss) => srv_fake_session(l, specs, accepts, ss)
+    }
+}
+
+func srv_fake_session(l: tcp.listener, specs: [str], accepts: int, ss: tcp.stream) -> Result<int, str> {
+    _u9 := srv_arm_timeouts(ss)
+    match srv_read_argv(ss) {
+        .err(_) => {
+            _u10 := srv_close(ss)
+            srv_fake_loop(l, specs, accepts + 1)
+        }
+        .ok(first) => srv_fake_framed(l, specs, accepts, ss, first)
+    }
+}
+
+// First frame of a counted session is handshake SETINFO#1; answer it here,
+// then run the rest of the handshake plus the scripted commands.
+
+func srv_fake_framed(l: tcp.listener, specs: [str], accepts: int, ss: tcp.stream, first: [str]) -> Result<int, str> {
+    _u11 := first
+    _u12 := ss.write("+OK\r\n")
+    match srv_read_argv(ss) {
+        .err(_) => {
+            println("FSRVFAIL hs2")
+            _u13 := srv_close(ss)
+            .ok(1)
+        }
+        .ok(_) => srv_fake_cmds(l, specs, ss)
+    }
+}
+
+func srv_fake_cmds(l: tcp.listener, specs: [str], ss: tcp.stream) -> Result<int, str> {
+    _u14 := l
+    _u15 := ss.write("+OK\r\n")
+    srv_fake_run(ss, specs, 0)
+}
+
+func srv_fake_run(ss: tcp.stream, specs: [str], i: int) -> Result<int, str> {
+    if i >= specs.len() {
+        println("FSRVDONE sessions=1")
+        _u16 := srv_close(ss)
+        return .ok(0)
+    }
+    match srv_read_argv(ss) {
+        .err(_) => {
+            println("FSRVFAIL cmd")
+            _u17 := srv_close(ss)
+            .ok(1)
+        }
+        .ok(_) => srv_fake_one(ss, specs, i)
+    }
+}
+
+func srv_fake_one(ss: tcp.stream, specs: [str], i: int) -> Result<int, str> {
+    st := srv_serve_spec(ss, specs[i])
+    srv_fake_after(ss, specs, i, st)
+}
+
+func srv_fake_after(ss: tcp.stream, specs: [str], i: int, st: int) -> Result<int, str> {
+    if st == 1 {
+        println("FSRVDONE sessions=1")
+        _u18 := srv_close(ss)
+        return .ok(0)
+    }
+    srv_fake_run(ss, specs, i + 1)
+}
+
+// c4: exactly one frame carrying AUTH; reject it as WRONGPASS (auth kind).
+
+func srv_c4(port: str) -> Result<int, str> {
+    match srv_listen(port) {
+        .err(e) => {
+            println("FSRVFAIL listen {e}")
+            .ok(1)
+        }
+        .ok(l) => srv_c4_loop(l, 0)
+    }
+}
+
+func srv_c4_loop(l: tcp.listener, accepts: int) -> Result<int, str> {
+    if accepts >= 4 {
+        println("FSRVFAIL too many accepts")
+        return .ok(1)
+    }
+    match l.accept() {
+        .err(e) => {
+            println("FSRVFAIL accept {e}")
+            .ok(1)
+        }
+        .ok(ss) => srv_c4_session(l, accepts, ss)
+    }
+}
+
+func srv_c4_session(l: tcp.listener, accepts: int, ss: tcp.stream) -> Result<int, str> {
+    _u19 := srv_arm_timeouts(ss)
+    match srv_read_argv(ss) {
+        .err(_) => {
+            _u20 := srv_close(ss)
+            srv_c4_loop(l, accepts + 1)
+        }
+        .ok(argv) => srv_c4_answer(ss, argv)
+    }
+}
+
+func srv_c4_answer(ss: tcp.stream, argv: [str]) -> Result<int, str> {
+    joined := str.join(argv, " ")
+    hits := 0
+    if str.contains(joined, "AUTH") {
+        hits = 1
+    }
+    _u21 := ss.write("-WRONGPASS invalid username-password pair\r\n")
+    _u22 := srv_close(ss)
+    println("FSRVDONE frames=1 auth_hits={hits}")
+    .ok(0)
+}
+
+// c7: handshake, read one frame, count INCR frames, close unanswered.
+
+func srv_c7(port: str) -> Result<int, str> {
+    match srv_listen(port) {
+        .err(e) => {
+            println("FSRVFAIL listen {e}")
+            .ok(1)
+        }
+        .ok(l) => srv_c7_loop(l, 0)
+    }
+}
+
+func srv_c7_loop(l: tcp.listener, accepts: int) -> Result<int, str> {
+    if accepts >= 4 {
+        println("FSRVFAIL too many accepts")
+        return .ok(1)
+    }
+    match l.accept() {
+        .err(e) => {
+            println("FSRVFAIL accept {e}")
+            .ok(1)
+        }
+        .ok(ss) => srv_c7_session(l, accepts, ss)
+    }
+}
+
+func srv_c7_session(l: tcp.listener, accepts: int, ss: tcp.stream) -> Result<int, str> {
+    _u23 := srv_arm_timeouts(ss)
+    match srv_read_argv(ss) {
+        .err(_) => {
+            _u24 := srv_close(ss)
+            srv_c7_loop(l, accepts + 1)
+        }
+        .ok(_) => srv_c7_framed(ss)
+    }
+}
+
+func srv_c7_framed(ss: tcp.stream) -> Result<int, str> {
+    hs := srv_handshake_after_first(ss)
+    srv_c7_after_hs(ss, hs)
+}
+
+func srv_handshake_after_first(ss: tcp.stream) -> str {
+    _u25 := ss.write("+OK\r\n")
+    srv_handshake2(ss)
+}
+
+func srv_c7_after_hs(ss: tcp.stream, hs: str) -> Result<int, str> {
+    if hs != "ok" {
+        println("FSRVFAIL hs {hs}")
+        _u26 := srv_close(ss)
+        return .ok(1)
+    }
+    match srv_read_argv(ss) {
+        .err(_) => {
+            println("FSRVFAIL cmd")
+            _u27 := srv_close(ss)
+            .ok(1)
+        }
+        .ok(argv) => srv_c7_answer(ss, argv)
+    }
+}
+
+func srv_c7_answer(ss: tcp.stream, argv: [str]) -> Result<int, str> {
+    hits := 0
+    if argv.len() > 0 {
+        if argv[0] == "INCR" {
+            hits = 1
+        }
+    }
+    _u28 := srv_close(ss)
+    println("FSRVDONE cmd_frames=1 incr_hits={hits}")
+    .ok(0)
+}
+
+// c8: session 1 drops a GET (close, no reply); session 2 serves "foo".
+
+func srv_c8(port: str) -> Result<int, str> {
+    match srv_listen(port) {
+        .err(e) => {
+            println("FSRVFAIL listen {e}")
+            .ok(1)
+        }
+        .ok(l) => srv_c8_loop(l, 0, 0, 0)
+    }
+}
+
+func srv_c8_loop(l: tcp.listener, accepts: int, sessions: int, gets: int) -> Result<int, str> {
+    if sessions >= 2 {
+        println("FSRVDONE sessions={sessions} get_hits={gets}")
+        return .ok(0)
+    }
+    if accepts >= 6 {
+        println("FSRVFAIL too many accepts")
+        return .ok(1)
+    }
+    match l.accept() {
+        .err(e) => {
+            println("FSRVFAIL accept {e}")
+            .ok(1)
+        }
+        .ok(ss) => srv_c8_session(l, accepts, sessions, gets, ss)
+    }
+}
+
+func srv_c8_session(l: tcp.listener, accepts: int, sessions: int, gets: int, ss: tcp.stream) -> Result<int, str> {
+    _u29 := srv_arm_timeouts(ss)
+    match srv_read_argv(ss) {
+        .err(_) => {
+            _u30 := srv_close(ss)
+            srv_c8_loop(l, accepts + 1, sessions, gets)
+        }
+        .ok(_) => srv_c8_framed(l, accepts, sessions, gets, ss)
+    }
+}
+
+func srv_c8_framed(l: tcp.listener, accepts: int, sessions: int, gets: int, ss: tcp.stream) -> Result<int, str> {
+    _u31 := ss.write("+OK\r\n")
+    match srv_read_argv(ss) {
+        .err(_) => {
+            println("FSRVFAIL hs2")
+            _u32 := srv_close(ss)
+            .ok(1)
+        }
+        .ok(_) => srv_c8_cmd(l, accepts, sessions, gets, ss)
+    }
+}
+
+func srv_c8_cmd(l: tcp.listener, accepts: int, sessions: int, gets: int, ss: tcp.stream) -> Result<int, str> {
+    _u33 := ss.write("+OK\r\n")
+    match srv_read_argv(ss) {
+        .err(_) => {
+            println("FSRVFAIL cmd")
+            _u34 := srv_close(ss)
+            .ok(1)
+        }
+        .ok(argv) => srv_c8_answer(l, accepts, sessions, gets, ss, argv)
+    }
+}
+
+func srv_c8_answer(l: tcp.listener, accepts: int, sessions: int, gets: int, ss: tcp.stream, argv: [str]) -> Result<int, str> {
+    g := gets
+    if argv.len() > 0 {
+        if argv[0] == "GET" {
+            g = gets + 1
+        }
+    }
+    srv_c8_finish(l, accepts, sessions, g, ss)
+}
+
+func srv_c8_finish(l: tcp.listener, accepts: int, sessions: int, gets: int, ss: tcp.stream) -> Result<int, str> {
+    if sessions == 0 {
+        _u35 := srv_close(ss)
+        return srv_c8_loop(l, accepts + 1, sessions + 1, gets)
+    }
+    _u36 := ss.write("$3\r\nfoo\r\n")
+    _u37 := srv_close(ss)
+    srv_c8_loop(l, accepts + 1, sessions + 1, gets)
+}
+
+// c9: handshake + one frame, then a scripted -CODE MSG error reply.
+
+func srv_c9(port: str, args: [str]) -> Result<int, str> {
+    if args.len() < 4 {
+        println("FSRVFAIL c9 needs CODE MSG")
+        return .ok(1)
+    }
+    code := args[2]
+    msg := args[3]
+    match srv_listen(port) {
+        .err(e) => {
+            println("FSRVFAIL listen {e}")
+            .ok(1)
+        }
+        .ok(l) => srv_c9_loop(l, code, msg, 0)
+    }
+}
+
+func srv_c9_loop(l: tcp.listener, code: str, msg: str, accepts: int) -> Result<int, str> {
+    if accepts >= 4 {
+        println("FSRVFAIL too many accepts")
+        return .ok(1)
+    }
+    match l.accept() {
+        .err(e) => {
+            println("FSRVFAIL accept {e}")
+            .ok(1)
+        }
+        .ok(ss) => srv_c9_session(l, code, msg, accepts, ss)
+    }
+}
+
+func srv_c9_session(l: tcp.listener, code: str, msg: str, accepts: int, ss: tcp.stream) -> Result<int, str> {
+    _u38 := srv_arm_timeouts(ss)
+    match srv_read_argv(ss) {
+        .err(_) => {
+            _u39 := srv_close(ss)
+            srv_c9_loop(l, code, msg, accepts + 1)
+        }
+        .ok(_) => srv_c9_framed(l, code, msg, ss)
+    }
+}
+
+func srv_c9_framed(l: tcp.listener, code: str, msg: str, ss: tcp.stream) -> Result<int, str> {
+    _u40 := l
+    hs := srv_handshake_after_first(ss)
+    srv_c9_after_hs(ss, code, msg, hs)
+}
+
+func srv_c9_after_hs(ss: tcp.stream, code: str, msg: str, hs: str) -> Result<int, str> {
+    if hs != "ok" {
+        println("FSRVFAIL hs {hs}")
+        _u41 := srv_close(ss)
+        return .ok(1)
+    }
+    match srv_read_argv(ss) {
+        .err(_) => {
+            println("FSRVFAIL cmd")
+            _u42 := srv_close(ss)
+            .ok(1)
+        }
+        .ok(_) => srv_c9_answer(ss, code, msg)
+    }
+}
+
+func srv_c9_answer(ss: tcp.stream, code: str, msg: str) -> Result<int, str> {
+    _u43 := ss.write("-{code} {msg}\r\n")
+    _u44 := srv_close(ss)
+    println("FSRVDONE cmd_frames=1 code={code}")
+    .ok(0)
+}
+
+// c10: session 1 stalls mid-bulk (partial + sleep + close); session 2 +OK.
+
+func srv_c10(port: str) -> Result<int, str> {
+    match srv_listen(port) {
+        .err(e) => {
+            println("FSRVFAIL listen {e}")
+            .ok(1)
+        }
+        .ok(l) => srv_c10_loop(l, 0, 0)
+    }
+}
+
+func srv_c10_loop(l: tcp.listener, accepts: int, sessions: int) -> Result<int, str> {
+    if sessions >= 2 {
+        println("FSRVDONE sessions={sessions}")
+        return .ok(0)
+    }
+    if accepts >= 6 {
+        println("FSRVFAIL too many accepts")
+        return .ok(1)
+    }
+    match l.accept() {
+        .err(e) => {
+            println("FSRVFAIL accept {e}")
+            .ok(1)
+        }
+        .ok(ss) => srv_c10_session(l, accepts, sessions, ss)
+    }
+}
+
+func srv_c10_session(l: tcp.listener, accepts: int, sessions: int, ss: tcp.stream) -> Result<int, str> {
+    _u45 := srv_arm_timeouts(ss)
+    match srv_read_argv(ss) {
+        .err(_) => {
+            _u46 := srv_close(ss)
+            srv_c10_loop(l, accepts + 1, sessions)
+        }
+        .ok(_) => srv_c10_framed(l, accepts, sessions, ss)
+    }
+}
+
+func srv_c10_framed(l: tcp.listener, accepts: int, sessions: int, ss: tcp.stream) -> Result<int, str> {
+    _u47 := ss.write("+OK\r\n")
+    match srv_read_argv(ss) {
+        .err(_) => {
+            println("FSRVFAIL hs2")
+            _u48 := srv_close(ss)
+            .ok(1)
+        }
+        .ok(_) => srv_c10_cmd(l, accepts, sessions, ss)
+    }
+}
+
+func srv_c10_cmd(l: tcp.listener, accepts: int, sessions: int, ss: tcp.stream) -> Result<int, str> {
+    _u49 := ss.write("+OK\r\n")
+    match srv_read_argv(ss) {
+        .err(_) => {
+            println("FSRVFAIL cmd")
+            _u50 := srv_close(ss)
+            .ok(1)
+        }
+        .ok(_) => srv_c10_answer(l, accepts, sessions, ss)
+    }
+}
+
+func srv_c10_answer(l: tcp.listener, accepts: int, sessions: int, ss: tcp.stream) -> Result<int, str> {
+    if sessions == 0 {
+        _u51 := ss.write("$10\r\nabc")
+        time.sleep_ms(1500)
+        _u52 := srv_close(ss)
+        return srv_c10_loop(l, accepts + 1, sessions + 1)
+    }
+    _u53 := ss.write("+OK\r\n")
+    _u54 := srv_close(ss)
+    srv_c10_loop(l, accepts + 1, sessions + 1)
+}

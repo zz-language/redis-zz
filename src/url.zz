@@ -1,0 +1,498 @@
+// url.zz — redis URL parser (plan v3 §7).
+//
+// Accepted forms:
+//   redis://[user[:pass]@]host[:port][/db][?params]
+//   rediss://...same, TLS on; extra params tls_ca, tls_insecure, tls_sni
+//   redis+unix:///path/to.sock[?db=1&...]
+//
+// Parsing is byte-level ([int] from str.bytes) so char/byte offsets can
+// never disagree; segments are cut only at ASCII delimiters, keeping any
+// UTF-8 inside credentials intact. Every failure is a typed RError naming
+// the segment — never a guess, never a panic.
+import std.bytes
+import std.str
+
+import redis.errors as errors
+
+// Parsed connection options. Field values are validated at parse time;
+// defaults match the plan (port 6379, db 0, pool 8, retries 3, proto 2,
+// connect 1000ms, read/write 500ms, name "redis-zz").
+
+pub struct Options {
+    scheme: str,
+    host: str,
+    port: int,
+    user: str,
+    pass: str,
+    db: int,
+    name: str,
+    connect_ms: int,
+    read_ms: int,
+    write_ms: int,
+    pool: int,
+    retries: int,
+    proto: int,
+    tls: bool,
+    tls_ca: str,
+    tls_sni: str,
+    tls_insecure: bool,
+    unix: str,
+}
+
+// Parse a redis URL into Options. Errors name the bad segment
+// (unsupported_scheme, missing_host, bad_port, db_out_of_range,
+// unknown_param, empty_password, bad_password, ...).
+
+pub func parse(raw: str) -> Result<Options, errors.RError> {
+    o := defaults()
+    raw_b := str.bytes(raw)
+    sep := find_seq(raw_b, str.bytes("://"), 0)
+    if sep < 0 {
+        return .err(errors.url_error("unsupported_scheme", "\"\", expected redis://, rediss://, or redis+unix://"))
+    }
+    scheme_b := raw_b[0:sep]
+    rest := raw_b[sep + 3:]
+    if scheme_b == str.bytes("redis") {
+        o.scheme = "redis"
+    } else if scheme_b == str.bytes("rediss") {
+        o.scheme = "rediss"
+        o.tls = true
+    } else if scheme_b == str.bytes("redis+unix") {
+        o.scheme = "redis+unix"
+    } else {
+        bad := bytes.to_str(scheme_b) ?? "?"
+        return .err(errors.url_error("unsupported_scheme", "\"{bad}\", expected redis://, rediss://, or redis+unix://"))
+    }
+    if find_byte(rest, 35, 0) >= 0 {
+        return .err(errors.url_error("fragment", "fragments (#...) are not part of redis URLs"))
+    }
+    qi := find_byte(rest, 63, 0)
+    head := rest
+    query := raw_b[0:0]
+    if qi >= 0 {
+        head = rest[0:qi]
+        query = rest[qi + 1:]
+    }
+    if o.scheme == "redis+unix" {
+        // The socket path is the authority+path remainder (everything up
+        // to '?'), so redis+unix:///tmp/r.sock just works.
+        if len(head) == 0 {
+            return .err(errors.url_error("missing_path", "empty socket path"))
+        }
+        o.unix = bytes.to_str(head) ?? ""
+        return parse_query(o, query)
+    }
+    // userinfo is everything before the LAST '@' (a raw '@' cannot appear
+    // inside user/pass unencoded, so the last one is the separator).
+    at := rfind_byte(head, 64)
+    hostport := head
+    if at >= 0 {
+        ui := head[0:at]
+        hostport = head[at + 1:]
+        ci := find_byte(ui, 58, 0)
+        if ci >= 0 {
+            o.user = bytes.to_str(ui[0:ci]) ?? ""
+            pass_enc := ui[ci + 1:]
+            if len(pass_enc) == 0 {
+                return .err(errors.url_error("empty_password", "user \"{o.user}\" has a colon but no password"))
+            }
+            o.pass = pct_to_str(pass_enc, "bad_password")?
+        } else {
+            // User without password is fine (ACL-style).
+            o.user = bytes.to_str(ui) ?? ""
+        }
+    }
+    // Optional /db after the first '/'.
+    slash := find_byte(hostport, 47, 0)
+    hostport_only := hostport
+    if slash >= 0 {
+        hostport_only = hostport[0:slash]
+        db_b := hostport[slash + 1:]
+        if len(db_b) > 0 {
+            v := to_uint(db_b, 2)
+            if v < 0 || v > 15 {
+                db_s := bytes.to_str(db_b) ?? "?"
+                return .err(errors.url_error("db_out_of_range", "\"{db_s}\", expected 0-15"))
+            }
+            o.db = v
+        }
+    }
+    // host[:port], with [ipv6][:port] support.
+    host_b := hostport_only
+    if len(hostport_only) > 0 && hostport_only[0] == 91 {
+        close := find_byte(hostport_only, 93, 1)
+        if close < 0 {
+            return .err(errors.url_error("bad_host", "unclosed '[': use [addr] or [addr]:port"))
+        }
+        host_b = hostport_only[1:close]
+        tail := hostport_only[close + 1:]
+        if len(tail) > 0 {
+            if tail[0] != 58 {
+                tail_s := bytes.to_str(tail) ?? "?"
+                return .err(errors.url_error("bad_port", "\"{tail_s}\", expected :port after ]"))
+            }
+            o.port = parse_port(tail[1:])?
+        }
+    } else {
+        ci := rfind_byte(hostport_only, 58)
+        if ci >= 0 {
+            host_b = hostport_only[0:ci]
+            if find_byte(host_b, 58, 0) >= 0 {
+                return .err(errors.url_error("bad_host", "bracket IPv6 literals: redis://[::1]:6379"))
+            }
+            o.port = parse_port(hostport_only[ci + 1:])?
+        }
+    }
+    if len(host_b) == 0 {
+        return .err(errors.url_error("missing_host", "empty host"))
+    }
+    o.host = bytes.to_str(host_b) ?? ""
+    parse_query(o, query)
+}
+
+// Rebuild a log-safe URL: the password (if any) becomes "***", everything
+// else round-trips. Display-only: when read_ms != write_ms the query shows
+// timeout_ms={read_ms} (documented, lossy); never parse this back and
+// expect identical timeouts in that case.
+
+pub func redacted(o: Options) -> str {
+    if o.scheme == "redis+unix" {
+        return "redis+unix://{o.unix}{redact_query(o)}"
+    }
+    out := "{o.scheme}://"
+    if o.user != "" || o.pass != "" {
+        if o.pass != "" {
+            out = out + "{o.user}:***@"
+        } else {
+            out = out + "{o.user}@"
+        }
+    }
+    out = out + o.host
+    if o.port != 6379 {
+        out = out + ":{o.port}"
+    }
+    if o.db != 0 {
+        out = out + "/{o.db}"
+    }
+    out = out + redact_query(o)
+    out
+}
+
+// Query string of non-default options for redacted(). Empty when the URL
+// carries no non-default knobs.
+
+func redact_query(o: Options) -> str {
+    parts:[str] = []
+    if o.scheme == "redis+unix" && o.db != 0 {
+        parts = parts.push("db={o.db}")
+    }
+    if o.connect_ms != 1000 {
+        parts = parts.push("connect_timeout_ms={o.connect_ms}")
+    }
+    if o.read_ms != 500 || o.write_ms != 500 {
+        parts = parts.push("timeout_ms={o.read_ms}")
+    }
+    if o.pool != 8 {
+        parts = parts.push("pool={o.pool}")
+    }
+    if o.retries != 3 {
+        parts = parts.push("retries={o.retries}")
+    }
+    if o.proto != 2 {
+        parts = parts.push("proto={o.proto}")
+    }
+    if o.name != "redis-zz" {
+        parts = parts.push("name={o.name}")
+    }
+    if o.tls_ca != "" {
+        parts = parts.push("tls_ca={o.tls_ca}")
+    }
+    if o.tls_sni != "" {
+        parts = parts.push("tls_sni={o.tls_sni}")
+    }
+    if o.tls_insecure {
+        parts = parts.push("tls_insecure=1")
+    }
+    if len(parts) == 0 {
+        return ""
+    }
+    "?{str.join(parts, "&")}"
+}
+
+// Defaults per the plan: port 6379, db 0, pool 8, retries 3, proto 2,
+// connect 1000ms, read/write 500ms, name "redis-zz".
+
+func defaults() -> Options {
+    Options{scheme: "redis", host: "", port: 6379, user: "", pass: "", db: 0, name: "redis-zz", connect_ms: 1000, read_ms: 500, write_ms: 500, pool: 8, retries: 3, proto: 2, tls: false, tls_ca: "", tls_sni: "", tls_insecure: false, unix: ""}
+}
+
+// Parse the query pairs of an already-split URL, applying each known param
+// onto `o`. Unknown params fail with a did-you-mean suggestion.
+
+func parse_query(o: Options, query: [int]) -> Result<Options, errors.RError> {
+    i := 0
+    while i < len(query) {
+        amp := find_byte(query, 38, i)
+        end := len(query)
+        if amp >= 0 {
+            end = amp
+        }
+        pair := query[i:end]
+        if len(pair) > 0 {
+            o = apply_param(o, pair)?
+        }
+        if amp < 0 {
+            break
+        }
+        i = amp + 1
+    }
+    .ok(o)
+}
+
+// Apply one key[=value] pair. Pure: takes Options, returns new Options.
+
+func apply_param(o: Options, pair: [int]) -> Result<Options, errors.RError> {
+    eq := find_byte(pair, 61, 0)
+    key_b := pair
+    val_b := pair[0:0]
+    bare := false
+    if eq >= 0 {
+        key_b = pair[0:eq]
+        val_b = pair[eq + 1:]
+    } else {
+        bare = true
+    }
+    key := bytes.to_str(key_b) ?? ""
+    vs := bytes.to_str(val_b) ?? "?"
+    if key == "timeout_ms" {
+        v := to_uint(val_b, 9)
+        if v < 0 {
+            return .err(errors.url_error("bad_query", "\"timeout_ms={vs}\", expected a non-negative integer (ms)"))
+        }
+        o.read_ms = v
+        o.write_ms = v
+    } else if key == "connect_timeout_ms" {
+        v := to_uint(val_b, 9)
+        if v < 0 {
+            return .err(errors.url_error("bad_query", "\"connect_timeout_ms={vs}\", expected a non-negative integer (ms)"))
+        }
+        o.connect_ms = v
+    } else if key == "pool" {
+        v := to_uint(val_b, 9)
+        if v < 1 {
+            return .err(errors.url_error("bad_query", "\"pool={vs}\", expected an integer >= 1"))
+        }
+        o.pool = v
+    } else if key == "retries" {
+        v := to_uint(val_b, 9)
+        if v < 0 {
+            return .err(errors.url_error("bad_query", "\"retries={vs}\", expected a non-negative integer"))
+        }
+        o.retries = v
+    } else if key == "proto" {
+        v := to_uint(val_b, 9)
+        if v != 2 && v != 3 {
+            return .err(errors.url_error("bad_query", "\"proto={vs}\", expected 2 or 3"))
+        }
+        o.proto = v
+    } else if key == "name" {
+        if bare {
+            return .err(errors.url_error("bad_query", "\"name\" needs a value, e.g. ?name=my-app"))
+        }
+        o.name = pct_to_str(val_b, "bad_query")?
+    } else if key == "db" {
+        v := to_uint(val_b, 2)
+        if v < 0 || v > 15 {
+            return .err(errors.url_error("db_out_of_range", "\"{vs}\", expected 0-15"))
+        }
+        o.db = v
+    } else if key == "tls_ca" {
+        if bare {
+            return .err(errors.url_error("bad_query", "\"tls_ca\" needs a path value"))
+        }
+        o.tls_ca = pct_to_str(val_b, "bad_query")?
+    } else if key == "tls_sni" {
+        if bare {
+            return .err(errors.url_error("bad_query", "\"tls_sni\" needs a hostname value"))
+        }
+        o.tls_sni = pct_to_str(val_b, "bad_query")?
+    } else if key == "tls_insecure" {
+        if bare {
+            // Flag-style: ?tls_insecure means on.
+            o.tls_insecure = true
+        } else if vs == "1" || vs == "true" {
+            o.tls_insecure = true
+        } else if vs == "0" || vs == "false" || vs == "" {
+            o.tls_insecure = false
+        } else {
+            return .err(errors.url_error("bad_query", "\"tls_insecure={vs}\", expected 1 or 0"))
+        }
+    } else {
+        best := suggest_param(key_b)
+        return .err(errors.url_error("unknown_param", "\"{key}\", did you mean \"{best}\"?"))
+    }
+    .ok(o)
+}
+
+// Port must be 1-65535.
+
+func parse_port(seg: [int]) -> Result<int, errors.RError> {
+    v := to_uint(seg, 5)
+    if v < 1 || v > 65535 {
+        s := bytes.to_str(seg) ?? "?"
+        return .err(errors.url_error("bad_port", "\"{s}\", expected 1-65535"))
+    }
+    .ok(v)
+}
+
+// Strict ASCII uint, capped at max_len digits (no overflow: 9 digits max
+// fits any 64-bit int). Returns -1 on any failure (empty, non-digit,
+// too long); callers range-check from there.
+
+func to_uint(seg: [int], max_len: int) -> int {
+    if len(seg) == 0 {
+        return -1
+    }
+    if len(seg) > max_len {
+        return -1
+    }
+    v := 0
+    for b in seg {
+        if b < 48 || b > 57 {
+            return -1
+        }
+        v = v * 10 + (b - 48)
+    }
+    v
+}
+
+// Percent-decode (%XX hex; '+' stays literal '+') at byte level.
+// Fails on a lone '%' or non-hex digits.
+
+func pct_decode(seg: [int]) -> Result<[int], str> {
+    out:[int] = []
+    i := 0
+    while i < len(seg) {
+        b := seg[i]
+        if b == 37 {
+            if i + 2 >= len(seg) {
+                return .err("lone '%' at offset {i}: use %25 for a literal percent")
+            }
+            hi := hex_val(seg[i + 1])
+            lo := hex_val(seg[i + 2])
+            if hi < 0 || lo < 0 {
+                return .err("bad %XX at offset {i}: hex digits only")
+            }
+            out = out.push(hi * 16 + lo)
+            i = i + 3
+        } else {
+            out = out.push(b)
+            i = i + 1
+        }
+    }
+    .ok(out)
+}
+
+// Percent-decode then require valid UTF-8, wrapping failures as RError
+// under `segment`.
+
+func pct_to_str(seg: [int], segment: str) -> Result<str, errors.RError> {
+    match pct_decode(seg) {
+        .err(d) => .err(errors.url_error(segment, d))
+        .ok(dec) => match bytes.to_str(dec) {
+            .err(_) => .err(errors.url_error(segment, "decoded bytes are not valid UTF-8"))
+            .ok(s) => .ok(s)
+        }
+    }
+}
+
+func hex_val(b: int) -> int {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87
+    }
+    -1
+}
+
+func find_byte(hay: [int], needle: int, start: int) -> int {
+    s := start
+    if s < 0 {
+        s = 0
+    }
+    while s < len(hay) {
+        if hay[s] == needle {
+            return s
+        }
+        s = s + 1
+    }
+    -1
+}
+
+func rfind_byte(hay: [int], needle: int) -> int {
+    s := len(hay) - 1
+    while s >= 0 {
+        if hay[s] == needle {
+            return s
+        }
+        s = s - 1
+    }
+    -1
+}
+
+func find_seq(hay: [int], needle: [int], start: int) -> int {
+    s := start
+    if s < 0 {
+        s = 0
+    }
+    last := len(hay) - len(needle)
+    while s <= last {
+        hit := true
+        j := 0
+        while j < len(needle) {
+            if hay[s + j] != needle[j] {
+                hit = false
+                break
+            }
+            j = j + 1
+        }
+        if hit {
+            return s
+        }
+        s = s + 1
+    }
+    -1
+}
+
+// Leading-byte overlap used for did-you-mean suggestions.
+
+func shared_prefix(a: [int], b: [int]) -> int {
+    n := 0
+    while n < len(a) && n < len(b) {
+        if a[n] != b[n] {
+            break
+        }
+        n = n + 1
+    }
+    n
+}
+
+// Closest known query param by shared-prefix length (first wins ties).
+
+func suggest_param(key: [int]) -> str {
+    best := "timeout_ms"
+    best_n := -1
+    cands:[str] = ["timeout_ms", "connect_timeout_ms", "pool", "retries", "proto", "name", "db", "tls_ca", "tls_insecure", "tls_sni"]
+    for c in cands {
+        n := shared_prefix(key, str.bytes(c))
+        if n > best_n {
+            best_n = n
+            best = c
+        }
+    }
+    best
+}

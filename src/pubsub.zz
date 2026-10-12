@@ -1,0 +1,262 @@
+// pubsub.zz — publish/subscribe with resubscribe + gap counter (plan v3 §12).
+//
+// A subscriber owns a dedicated connection (normal commands are never
+// exposed on it). Functional threading: listen() returns the next message
+// AND the updated subscriber (reconnects replace the conn, bump the gap).
+// No tasks/threads inside: the caller loops.
+//
+// Gap semantics (§10.4): gap counts reconnects since the last DELIVERED
+// message; it is attached to the next delivered Msg (0 on a clean stream).
+// RESP2 push-mode arrays ([message, channel, payload] / [pmessage,
+// pattern, channel, payload]); RESP3 push (>) decodes the same way.
+import redis.conn as conn
+import redis.errors as errors
+import redis.resp as resp
+import redis.transport as transport
+import redis.url as url
+
+pub struct Sub {
+    t: transport.Transport,
+    channels: [str],
+    patterns: [str],
+    gap: int,
+    opts: url.Options,
+}
+
+pub struct Msg {
+    channel: str,
+    payload: str,
+    gap: int,
+}
+
+pub struct NextOut {
+    msg: Msg,
+    sub: Sub,
+}
+
+// Subscribe on a FRESH connection (never the shared client conn).
+
+pub func subscribe(o: url.Options, channels: [str]) -> Result<Sub, errors.RError> {
+    match conn.dial(o) {
+        .ok(c) => {
+            s := Sub{t: c.t, channels: [], patterns: [], gap: 0, opts: o}
+            match sub_cmd(s, "SUBSCRIBE", channels) {
+                .ok(ns) => .ok(ns)
+                .err(e) => {
+                    transport.close(s.t)
+                    .err(e)
+                }
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func psubscribe(o: url.Options, patterns: [str]) -> Result<Sub, errors.RError> {
+    match conn.dial(o) {
+        .ok(c) => {
+            s := Sub{t: c.t, channels: [], patterns: [], gap: 0, opts: o}
+            match sub_cmd(s, "PSUBSCRIBE", patterns) {
+                .ok(ns) => .ok(ns)
+                .err(e) => {
+                    transport.close(s.t)
+                    .err(e)
+                }
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+// Block for the next message (uses the connection read deadline).
+// On IO failure: redial + resubscribe recorded channels/patterns, bump
+// gap, and continue (the gap rides on the next delivered message).
+
+pub func next(s: Sub) -> Result<NextOut, errors.RError> {
+    sub := s
+    while true {
+        match read_push(sub) {
+            .ok(m) => {
+                g := sub.gap
+                ns := Sub{t: sub.t, channels: sub.channels, patterns: sub.patterns, gap: 0, opts: sub.opts}
+                return .ok(NextOut{msg: Msg{channel: m.channel, payload: m.payload, gap: g}, sub: ns})
+            }
+            .err(e) => {
+                if !errors.is_io(e) {
+                    return .err(e)
+                }
+                match resubscribe(sub) {
+                    .ok(ns) => {
+                        sub = ns
+                    }
+                    .err(re) => return .err(re)
+                }
+            }
+        }
+    }
+    // Unreachable (listen blocks until message or fatal), kept for the
+    // checker's totality requirement.
+    return .err(errors.closed_error("subscribe"))
+}
+
+func read_push(s: Sub) -> Result<Msg, errors.RError> {
+    match conn.read_reply(s.t, resp.default_limits()) {
+        .ok(r) => decode_push(r.arena, r.id)
+        .err(e) => .err(e)
+    }
+}
+
+// Decode one push frame into (channel, payload), any shape.
+
+func decode_push(a: resp.Arena, id: int) -> Result<Msg, errors.RError> {
+    v := resp.Value{id: id}
+    match resp.as_array(a, v) {
+        .ok(vs) => {
+            if vs.len() == 3 {
+                match resp.as_str(a, vs[0]) {
+                    .ok(kind) => {
+                        if kind == "message" {
+                            return str_pair(a, vs[1], vs[2])
+                        }
+                        if kind == "pmessage" {
+                            return str_pair(a, vs[1], vs[2])
+                        }
+                        return .err(errors.protocol_error("unexpected_push {kind}"))
+                    }
+                    .err(_) => return .err(errors.protocol_error("unexpected_push noname"))
+                }
+            }
+            if vs.len() == 4 {
+                return str_pair(a, vs[2], vs[3])
+            }
+            .err(errors.protocol_error("unexpected_push arity"))
+        }
+        .err(_) => .err(errors.protocol_error("unexpected_push shape"))
+    }
+}
+
+func str_pair(a: resp.Arena, c: resp.Value, p: resp.Value) -> Result<Msg, errors.RError> {
+    match resp.as_str(a, c) {
+        .ok(ch) => {
+            match resp.as_str(a, p) {
+                .ok(pl) => .ok(Msg{channel: ch, payload: pl, gap: 0})
+                .err(e) => .err(e)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+func sub_cmd(s: Sub, cmd: str, targets: [str]) -> Result<Sub, errors.RError> {
+    args := [cmd]
+    for t in targets {
+        args = args.push(t)
+    }
+    frame := resp.encode(args)
+    match transport.write(s.t, frame) {
+        .ok(_) => {
+            i := 0
+            cur := s
+            while i < targets.len() {
+                match conn.read_reply(cur.t, resp.default_limits()) {
+                    .ok(_) => {
+                        i = i + 1
+                    }
+                    .err(e) => return .err(e)
+                }
+            }
+            added := cur.channels
+            if cmd == "SUBSCRIBE" {
+                for t in targets {
+                    added = added.push(t)
+                }
+            }
+            pats := cur.patterns
+            if cmd == "PSUBSCRIBE" {
+                for t in targets {
+                    pats = pats.push(t)
+                }
+            }
+            .ok(Sub{t: cur.t, channels: added, patterns: pats, gap: cur.gap, opts: cur.opts})
+        }
+        .err(e) => .err(e)
+    }
+}
+
+func resubscribe(s: Sub) -> Result<Sub, errors.RError> {
+    transport.close(s.t)
+    match conn.dial(s.opts) {
+        .ok(c) => {
+            ns := Sub{t: c.t, channels: [], patterns: [], gap: s.gap + 1, opts: s.opts}
+            match sub_cmd(ns, "SUBSCRIBE", s.channels) {
+                .ok(s2) => {
+                    match sub_cmd(s2, "PSUBSCRIBE", s.patterns) {
+                        .ok(s3) => .ok(s3)
+                        .err(e) => .err(e)
+                    }
+                }
+                .err(e) => .err(e)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func unsubscribe(s: Sub, channels: [str]) -> Result<Sub, errors.RError> {
+    got := difference(s.channels, channels)
+    match unsub_cmd(s, "UNSUBSCRIBE", channels) {
+        .ok(ns) => .ok(Sub{t: ns.t, channels: got, patterns: ns.patterns, gap: ns.gap, opts: ns.opts})
+        .err(e) => .err(e)
+    }
+}
+
+pub func punsubscribe(s: Sub, patterns: [str]) -> Result<Sub, errors.RError> {
+    got := difference(s.patterns, patterns)
+    match unsub_cmd(s, "PUNSUBSCRIBE", patterns) {
+        .ok(ns) => .ok(Sub{t: ns.t, channels: ns.channels, patterns: got, gap: ns.gap, opts: ns.opts})
+        .err(e) => .err(e)
+    }
+}
+
+func difference(have: [str], gone: [str]) -> [str] {
+    out: [str] = []
+    for h in have {
+        keep := true
+        for g in gone {
+            if h == g {
+                keep = false
+            }
+        }
+        if keep {
+            out = out.push(h)
+        }
+    }
+    out
+}
+
+func unsub_cmd(s: Sub, cmd: str, targets: [str]) -> Result<Sub, errors.RError> {
+    args := [cmd]
+    for t in targets {
+        args = args.push(t)
+    }
+    frame := resp.encode(args)
+    match transport.write(s.t, frame) {
+        .ok(_) => {
+            i := 0
+            while i < targets.len() {
+                match conn.read_reply(s.t, resp.default_limits()) {
+                    .ok(_) => {
+                        i = i + 1
+                    }
+                    .err(e) => return .err(e)
+                }
+            }
+            .ok(s)
+        }
+        .err(e) => .err(e)
+    }
+}
+
+pub func close(s: Sub) -> int {
+    transport.close(s.t)
+}

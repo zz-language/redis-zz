@@ -1,0 +1,458 @@
+// live_tls_test.zz — env-gated TLS subset against a real server.
+//
+// REDISS_URL defaults to rediss://127.0.0.1:6380?tls_ca=/tmp/redis-tls/ca.pem.
+// Connect gate: conn_refused SKIP-passes (println + return) so the file is
+// green with and without servers; every other outcome is asserted strictly
+// (negative TLS cases expect kind tls with the exact detail). Blob and
+// timeout budgets mirror live_test.zz. Single-threaded throughout.
+import std.bytes
+import std.env
+import std.net
+import std.process
+import std.str
+
+import redis.client as client
+import redis.cmds as cmds
+import redis.errors as errors
+import redis.url as url
+
+func tlive_url_raw() -> str {
+    env.get("REDISS_URL") ?? "rediss://127.0.0.1:6380?tls_ca=/tmp/redis-tls/ca.pem"
+}
+
+func tlive_dial() -> Result<client.Client, errors.RError> {
+    match url.parse(tlive_url_raw()) {
+        .ok(o) => tlive_dial_opts(o)
+        .err(e) => .err(e)
+    }
+}
+
+func tlive_dial_opts(o: url.Options) -> Result<client.Client, errors.RError> {
+    o.connect_ms = 500
+    o.read_ms = 5000
+    o.write_ms = 5000
+    client.connect_with(o)
+}
+
+// Presence probe for any URL: raw TCP to its host:port (1 = present,
+// 0 = absent/SKIP, err = unparsable URL). TLS maps a refused handshake to
+// bare handshake_failed with the refused cause dropped, so negatives and
+// positives alike gate on TCP presence first, never on the TLS kind.
+
+func tlive_present_for(raw: str) -> Result<int, str> {
+    match url.parse(raw) {
+        .ok(o) => .ok(tlive_probe_port(o))
+        .err(e) => .err(e.detail)
+    }
+}
+
+func tlive_probe_port(o: url.Options) -> int {
+    match net.tcp_connect("{o.host}:{o.port}", 500) {
+        .ok(raw) => tlive_probe_hit(raw)
+        .err(_) => 0
+    }
+}
+
+func tlive_probe_hit(raw: tcp.stream) -> int {
+    _u1 := raw.close()
+    1
+}
+
+func tlive_skip_for(what: str, raw: str) -> int {
+    println("SKIP {what}: no live server at {raw}")
+    0
+}
+
+func tlive_key(name: str) -> str {
+    "zz:{process.pid()}:tls:{name}"
+}
+
+func tlive_must_bytes(xs: [int]) -> bytes {
+    match bytes.finish(xs) {
+        .ok(b) => b
+        .err(_) => tlive_must_bytes([0])
+    }
+}
+
+func tlive_dbl(xs: [int]) -> [int] {
+    out := xs
+    for x in xs {
+        out = out.push(x)
+    }
+    out
+}
+
+// Deterministic 64KiB blob: 1KiB base doubled 6 times.
+
+func tlive_blob_64k() -> bytes {
+    chunk:[int] = []
+    i := 0
+    while i < 1024 {
+        chunk = chunk.push(i % 251)
+        i = i + 1
+    }
+    c := chunk
+    j := 0
+    while j < 6 {
+        c = tlive_dbl(c)
+        j = j + 1
+    }
+    tlive_must_bytes(c)
+}
+
+@test
+func livetls_ping() {
+    assert(cmds.version() != "")
+    _u9 := match tlive_present_for(tlive_url_raw()) {
+        .ok(p) => tlive_ping_after(p)
+        .err(e) => {
+            println("FAIL url {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_ping_after(present: int) -> int {
+    if present == 0 {
+        return tlive_skip_for("ping", tlive_url_raw())
+    }
+    match tlive_dial() {
+        .ok(c) => tlive_ping_body(c)
+        .err(e) => {
+            println("FAIL ping dial {e.kind} {e.detail}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_ping_body(c: client.Client) -> int {
+    bad := 0
+    match c.ping() {
+        .ok(p) => {
+            if p != "PONG" {
+                println("FAIL want PONG got {p}")
+                bad = bad + 1
+            }
+        }
+        .err(e) => {
+            println("FAIL ping {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+@test
+func livetls_blob_64k_roundtrip() {
+    _u9 := match tlive_present_for(tlive_url_raw()) {
+        .ok(p) => tlive_blob_after(p)
+        .err(e) => {
+            println("FAIL url {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_blob_after(present: int) -> int {
+    if present == 0 {
+        return tlive_skip_for("blob_64k", tlive_url_raw())
+    }
+    match tlive_dial() {
+        .ok(c) => tlive_blob_body(c)
+        .err(e) => {
+            println("FAIL blob dial {e.kind} {e.detail}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_blob_body(c: client.Client) -> int {
+    bad := 0
+    k := tlive_key("big")
+    blob := tlive_blob_64k()
+    want := bytes.to_ints(blob)
+    if want.len() != 65536 {
+        println("FAIL blob build len {want.len()}")
+        bad = bad + 1
+    }
+    match c.set_bytes(k, blob) {
+        .ok(_) => {
+            bad = bad + 0
+        }
+        .err(e) => {
+            println("FAIL set_bytes {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.get_bytes(k) {
+        .ok(v) => {
+            bad = bad + tlive_blob_got(v, want)
+        }
+        .err(e) => {
+            println("FAIL get_bytes {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.del([k]) {
+        .ok(_) => {
+            bad = bad + 0
+        }
+        .err(e) => {
+            println("FAIL del {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+func tlive_blob_got(v: Option<[int]>, want: [int]) -> int {
+    match v {
+        .some(got) => tlive_blob_eq(got, want)
+        .none => {
+            println("FAIL want blob got miss")
+            1
+        }
+    }
+}
+
+func tlive_blob_eq(got: [int], want: [int]) -> int {
+    if got.len() != want.len() {
+        println("FAIL blob len {got.len()} want {want.len()}")
+        return 1
+    }
+    if got == want {
+        return 0
+    }
+    println("FAIL blob bytes differ")
+    1
+}
+
+@test
+func livetls_no_ca_is_untrusted() {
+    raw := "rediss://127.0.0.1:6380"
+    _u9 := match tlive_present_for(raw) {
+        .ok(p) => tlive_noca_after(p, raw)
+        .err(e) => {
+            println("FAIL url {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_noca_after(present: int, raw: str) -> int {
+    if present == 0 {
+        return tlive_skip_for("no_ca", raw)
+    }
+    match url.parse(raw) {
+        .ok(o) => tlive_noca_run(o)
+        .err(e) => {
+            println("FAIL url {e.kind}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// No CA for a private-CA server: tls cert_untrusted (absent server SKIPs
+// via the pre-probe above).
+
+func tlive_noca_run(o: url.Options) -> int {
+    o.connect_ms = 500
+    match client.connect_with(o) {
+        .ok(c) => {
+            println("FAIL want cert_untrusted, connected")
+            _u1 := client.close(c)
+            assert(false)
+            1
+        }
+        .err(e) => tlive_noca_kind(e)
+    }
+}
+
+func tlive_noca_kind(e: errors.RError) -> int {
+    bad := 0
+    if e.kind != "tls" {
+        println("FAIL want tls got {e.kind} {e.detail}")
+        bad = bad + 1
+    }
+    if str.contains(e.detail, "cert_untrusted") == false {
+        println("FAIL detail {e.detail}")
+        bad = bad + 1
+    }
+    assert(bad == 0)
+    bad
+}
+
+@test
+func livetls_wrong_sni_is_hostname() {
+    raw := "rediss://127.0.0.1:6380?tls_ca=/tmp/redis-tls/ca.pem&tls_sni=wrong.invalid"
+    _u9 := match tlive_present_for(raw) {
+        .ok(p) => tlive_sni_after(p, raw)
+        .err(e) => {
+            println("FAIL url {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_sni_after(present: int, raw: str) -> int {
+    if present == 0 {
+        return tlive_skip_for("wrong_sni", raw)
+    }
+    match url.parse(raw) {
+        .ok(o) => tlive_sni_run(o)
+        .err(e) => {
+            println("FAIL url {e.kind}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_sni_run(o: url.Options) -> int {
+    o.connect_ms = 500
+    match client.connect_with(o) {
+        .ok(c) => {
+            println("FAIL want cert_hostname, connected")
+            _u1 := client.close(c)
+            assert(false)
+            1
+        }
+        .err(e) => tlive_sni_kind(e)
+    }
+}
+
+func tlive_sni_kind(e: errors.RError) -> int {
+    bad := 0
+    if e.kind != "tls" {
+        println("FAIL want tls got {e.kind} {e.detail}")
+        bad = bad + 1
+    }
+    if str.contains(e.detail, "cert_hostname") == false {
+        println("FAIL detail {e.detail}")
+        bad = bad + 1
+    }
+    assert(bad == 0)
+    bad
+}
+
+@test
+func livetls_insecure_connects() {
+    raw := "rediss://127.0.0.1:6380?tls_insecure=1"
+    _u9 := match tlive_present_for(raw) {
+        .ok(p) => tlive_insecure_after(p, raw)
+        .err(e) => {
+            println("FAIL url {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_insecure_after(present: int, raw: str) -> int {
+    if present == 0 {
+        return tlive_skip_for("insecure", raw)
+    }
+    match url.parse(raw) {
+        .ok(o) => tlive_insecure_run(o)
+        .err(e) => {
+            println("FAIL url {e.kind}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_insecure_run(o: url.Options) -> int {
+    o.connect_ms = 500
+    o.read_ms = 5000
+    o.write_ms = 5000
+    match client.connect_with(o) {
+        .ok(c) => tlive_insecure_body(c)
+        .err(e) => {
+            println("FAIL insecure dial {e.kind} {e.detail}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_insecure_body(c: client.Client) -> int {
+    bad := 0
+    match c.ping() {
+        .ok(p) => {
+            if p != "PONG" {
+                println("FAIL want PONG got {p}")
+                bad = bad + 1
+            }
+        }
+        .err(e) => {
+            println("FAIL ping {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+@test
+func livetls_plaintext_port_is_tls_error() {
+    raw := "rediss://127.0.0.1:6379?tls_insecure=1&connect_timeout_ms=800"
+    _u9 := match tlive_present_for(raw) {
+        .ok(p) => tlive_plain_after(p, raw)
+        .err(e) => {
+            println("FAIL url {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func tlive_plain_after(present: int, raw: str) -> int {
+    if present == 0 {
+        return tlive_skip_for("plain_port", raw)
+    }
+    match url.parse(raw) {
+        .ok(o) => tlive_plain_run(o)
+        .err(e) => {
+            println("FAIL url {e.kind}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// TLS handshake against a plaintext port fails fast with kind tls (no
+// downgrade, no hang). Absent TCP server SKIPs.
+
+func tlive_plain_run(o: url.Options) -> int {
+    match client.connect_with(o) {
+        .ok(c) => {
+            println("FAIL want tls error, connected")
+            _u1 := client.close(c)
+            assert(false)
+            1
+        }
+        .err(e) => tlive_plain_kind(e)
+    }
+}
+
+func tlive_plain_kind(e: errors.RError) -> int {
+    if e.kind != "tls" {
+        println("FAIL want tls got {e.kind} {e.detail}")
+        assert(false)
+        return 1
+    }
+    0
+}

@@ -1,0 +1,276 @@
+// pool.zz — fixed pool behind the v0.1 Client API (plan v3 §11).
+//
+// N connections are dialed up front; checkout hands out a slot index,
+// checkin returns it. Slot Clients are full v0.1 Clients (same exchange,
+// same retry policy); the pool adds no retry of its own — an idempotent
+// command already retried inside exchange, and anything else returns its
+// error honestly (Ambiguous stays Ambiguous).
+//
+// Contention model: the free-slot chan carries indices; try_recv polls
+// without blocking and checkout sleeps in 10ms slices until wait_ms is
+// exhausted, then PoolExhausted. Stats are best-effort advisory under
+// contention (get-modify-set through a cell can lose increments when two
+// threads interleave); correctness of checkout/checkin never depends on
+// them — the chan is the single source of free truth.
+//
+// WATCH/MULTI pins its connection: pooled callers needing a transaction
+// must checkout exclusively (pinned), run pipe/multi on the slot Client
+// via conn_at, then checkin — never share a watched slot. Pub/Sub owns
+// its connection outright (not pooled here).
+import std.cell
+import std.chan
+import std.time
+
+import redis.client as client
+import redis.conn as conn
+import redis.errors as errors
+import redis.url as url
+
+// Snapshot counters. hits = successful checkouts, misses = exhausted
+// waits (PoolExhausted), size = fixed capacity, in_use = checked out now,
+// waits = 10ms slices slept inside checkout.
+
+pub struct PoolStats {
+    hits: int,
+    misses: int,
+    size: int,
+    in_use: int,
+    waits: int,
+}
+
+// conns cell holds [client.Client] (slot i = conns[i]); free chan carries
+// free indices (int); stats cell holds PoolStats. Pool is a cheap handle
+// (cells/chan are shared): copies refer to the same pool.
+
+pub struct Pool {
+    conns: cell,
+    free: chan,
+    size: int,
+    stats: cell,
+}
+
+// Dial o.pool connections sequentially. First failure closes the ones
+// already dialed and errors (no half-open pool escapes). Pre-fills the
+// free chan with 0..size-1; stats zeroed with size=o.pool.
+// o.pool < 1 (only possible by hand-built Options; the URL parser
+// requires >= 1) is a protocol_error, never a zero-size pool.
+
+pub func open(o: url.Options) -> Result<Pool, errors.RError> {
+    size := o.pool
+    if size < 1 {
+        return .err(errors.protocol_error("pool_size {size} (need >= 1)"))
+    }
+    conns:[client.Client] = []
+    i := 0
+    while i < size {
+        match client.connect_with(o) {
+            .ok(c) => {
+                conns = conns.push(c)
+            }
+            .err(e) => {
+                _u1 := close_list(conns)
+                return .err(e)
+            }
+        }
+        i = i + 1
+    }
+    free := std.chan()
+    j := 0
+    while j < size {
+        std.chan.send(free, j)
+        j = j + 1
+    }
+    .ok(Pool{conns: cell.new(conns), free: free, size: size, stats: cell.new(PoolStats{hits: 0, misses: 0, size: size, in_use: 0, waits: 0})})
+}
+
+func close_list(conns: [client.Client]) -> int {
+    n := 0
+    i := 0
+    while i < conns.len() {
+        n = n + client.close(conns[i])
+        i = i + 1
+    }
+    n
+}
+
+// Checkout one slot index, waiting up to wait_ms (10ms sleep slices).
+// Success bumps hits and in_use; each slice slept bumps waits; timeout
+// bumps misses and returns PoolExhausted(wait_ms).
+
+pub func checkout(p: Pool, wait_ms: int) -> Result<int, errors.RError> {
+    match std.chan.try_recv(p.free) {
+        .some(idx) => {
+            stats_add(p, 1, 0, 1, 0)
+            .ok(idx)
+        }
+        .none => wait_loop(p, wait_ms, 0)
+    }
+}
+
+func wait_loop(p: Pool, wait_ms: int, waited: int) -> Result<int, errors.RError> {
+    if waited >= wait_ms {
+        stats_add(p, 0, 1, 0, 0)
+        return .err(errors.pool_error(wait_ms))
+    }
+    time.sleep_ms(10)
+    stats_add(p, 0, 0, 0, 1)
+    match std.chan.try_recv(p.free) {
+        .some(idx) => {
+            stats_add(p, 1, 0, 1, 0)
+            .ok(idx)
+        }
+        .none => wait_loop(p, wait_ms, waited + 10)
+    }
+}
+
+// Return a slot. Always succeeds (0); sending the index back makes the
+// slot available and in_use drops. Double-checkin duplicates the index
+// (caller discipline — same rule as any fixed pool).
+
+pub func checkin(p: Pool, idx: int) -> int {
+    std.chan.send(p.free, idx)
+    stats_add(p, 0, 0, -1, 0)
+}
+
+// Read the slot Client out of the conns cell (bounds-checked). The Client
+// is a cheap handle over a shared slot cell: using it talks on slot idx.
+
+pub func conn_at(p: Pool, idx: int) -> Result<client.Client, errors.RError> {
+    match cell.get(p.conns) {
+        .ok(v) => {
+            conns:[client.Client] = v
+            if idx < 0 || idx >= conns.len() {
+                return .err(errors.protocol_error("pool_slot {idx} out of range"))
+            }
+            .ok(conns[idx])
+        }
+        .err(_) => .err(errors.closed_error("pool"))
+    }
+}
+
+// Redial slot idx (broken peer). client.redial replaces the shared slot
+// cell in place, so no array write-back is needed. Returns 0; on redial
+// failure the slot keeps its old connection and the error is returned.
+
+pub func rotate(p: Pool, idx: int) -> Result<int, errors.RError> {
+    match conn_at(p, idx) {
+        .ok(c) => {
+            match client.redial(c) {
+                .ok(_) => .ok(0)
+                .err(e) => .err(e)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+// Snapshot copy of the counters (advisory under contention, see header).
+
+pub func stats(p: Pool) -> PoolStats {
+    match cell.get(p.stats) {
+        .ok(v) => {
+            st:PoolStats = v
+            st
+        }
+        .err(_) => PoolStats{hits: 0, misses: 0, size: 0, in_use: 0, waits: 0}
+    }
+}
+
+// Close every connection, best effort. Always succeeds (0).
+
+pub func close(p: Pool) -> int {
+    match cell.get(p.conns) {
+        .ok(v) => {
+            conns:[client.Client] = v
+            close_list(conns)
+        }
+        .err(_) => 0
+    }
+}
+
+// One pooled call: checkout (1000ms wait), exchange on the slot Client,
+// checkin, return. On exchange IO error the slot is rotated (fresh peer
+// for the next caller) and the ORIGINAL error is returned — the pool
+// never silently retries at this level. Non-IO errors leave the slot
+// as-is (protocol state is still in sync).
+
+pub func with(p: Pool, cmd: str, args: [str], idem: bool, timeout_ms: int) -> Result<conn.Reply, errors.RError> {
+    match checkout(p, 1000) {
+        .ok(idx) => with_slot(p, idx, cmd, args, idem, timeout_ms)
+        .err(e) => .err(e)
+    }
+}
+
+func with_slot(p: Pool, idx: int, cmd: str, args: [str], idem: bool, timeout_ms: int) -> Result<conn.Reply, errors.RError> {
+    full := [cmd]
+    for a in args {
+        full = full.push(a)
+    }
+    match conn_at(p, idx) {
+        .ok(c) => {
+            match client.exchange(c, full, idem, timeout_ms) {
+                .ok(r) => {
+                    _u2 := checkin(p, idx)
+                    .ok(r)
+                }
+                .err(e) => with_failed(p, idx, c, e)
+            }
+        }
+        .err(e) => {
+            _u5 := checkin(p, idx)
+            .err(e)
+        }
+    }
+}
+
+func resync(c: client.Client) -> int {
+    match client.redial(c) {
+        .ok(_) => 0
+        .err(_) => 0
+    }
+}
+
+// IO error after bytes went out: the slot peer is suspect, rotate it
+// (best effort, result ignored); anything else leaves the slot as-is.
+
+func with_failed(p: Pool, idx: int, c: client.Client, e: errors.RError) -> Result<conn.Reply, errors.RError> {
+    _u3 := resync_maybe(c, e)
+    _u4 := checkin(p, idx)
+    .err(e)
+}
+
+func resync_maybe(c: client.Client, e: errors.RError) -> int {
+    if errors.is_io(e) {
+        return resync(c)
+    }
+    0
+}
+
+// Exclusive checkout for transactions (WATCH/MULTI pipe.multi): an alias
+// for checkout with pinning docs. Hold the index across the whole
+// WATCH...EXEC sequence (conn_at + direct pipe/multi on the slot Client),
+// checkin only after EXEC/DISCARD/UNWATCH — a watched slot must never be
+// shared or returned mid-transaction.
+
+pub func pinned(p: Pool, wait_ms: int) -> Result<int, errors.RError> {
+    checkout(p, wait_ms)
+}
+
+// Best-effort stats add (get-modify-set; advisory under contention).
+
+func stats_add(p: Pool, dh: int, dm: int, du: int, dw: int) -> int {
+    match cell.get(p.stats) {
+        .ok(v) => {
+            st:PoolStats = v
+            st.hits = st.hits + dh
+            st.misses = st.misses + dm
+            st.in_use = st.in_use + du
+            st.waits = st.waits + dw
+            match cell.set(p.stats, st) {
+                .ok(_) => 0
+                .err(_) => 0
+            }
+        }
+        .err(_) => 0
+    }
+}

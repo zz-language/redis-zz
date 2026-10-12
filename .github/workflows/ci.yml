@@ -1,0 +1,75 @@
+name: redis-zz CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Pin to a tag like v0.2.2 to reproduce; empty (default) = latest release.
+  ZZ_VERSION: ""
+
+jobs:
+  check-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ZZ compiler (latest release)
+        run: |
+          set -euo pipefail
+          TAG="${ZZ_VERSION:-$(curl -fsSL https://api.github.com/repos/zaidejjo/zz/releases/latest | jq -r .tag_name)}"
+          VER="${TAG#v}"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64) ASSET_ARCH="x86_64" ;;
+            aarch64|arm64) ASSET_ARCH="aarch64" ;;
+            *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
+          esac
+          echo "Installing zz $TAG ($ASSET_ARCH)"
+          curl -fsSL -o /tmp/zz.zip "https://github.com/zaidejjo/zz/releases/download/${TAG}/zz-${VER}-linux-${ASSET_ARCH}.zip"
+          rm -rf /tmp/zz-dist && mkdir -p /tmp/zz-dist "$HOME/.cargo/bin"
+          unzip -o -q /tmp/zz.zip -d /tmp/zz-dist
+          BIN="$(find /tmp/zz-dist -name zz -type f | head -n 1)"
+          test -n "$BIN" || { echo "zz binary not found in release zip" >&2; exit 1; }
+          install -m 0755 "$BIN" "$HOME/.cargo/bin/zz"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          zz --version
+      - name: Check
+        run: zz check src/
+      - name: Unit tests (VM)
+        run: zz test tests/
+  live:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ZZ compiler (latest release)
+        run: |
+          set -euo pipefail
+          TAG="${ZZ_VERSION:-$(curl -fsSL https://api.github.com/repos/zaidejjo/zz/releases/latest | jq -r .tag_name)}"
+          VER="${TAG#v}"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64) ASSET_ARCH="x86_64" ;;
+            aarch64|arm64) ASSET_ARCH="aarch64" ;;
+            *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
+          esac
+          echo "Installing zz $TAG ($ASSET_ARCH)"
+          curl -fsSL -o /tmp/zz.zip "https://github.com/zaidejjo/zz/releases/download/${TAG}/zz-${VER}-linux-${ASSET_ARCH}.zip"
+          rm -rf /tmp/zz-dist && mkdir -p /tmp/zz-dist "$HOME/.cargo/bin"
+          unzip -o -q /tmp/zz.zip -d /tmp/zz-dist
+          BIN="$(find /tmp/zz-dist -name zz -type f | head -n 1)"
+          test -n "$BIN" || { echo "zz binary not found in release zip" >&2; exit 1; }
+          install -m 0755 "$BIN" "$HOME/.cargo/bin/zz"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          zz --version
+      - name: Live tests
+        run: REDIS_URL="redis://127.0.0.1:6379" zz test tests/live_test.zz
+      - name: Examples
+        run: |
+          for f in quickstart rate_limiter sessions queue cache_aside; do
+            zz run examples/$f.zz
+          done

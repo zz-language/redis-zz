@@ -1,0 +1,77 @@
+import std.time
+
+import redis
+
+func kilo() -> str {
+    s := "x"
+    i := 0
+    while i < 10 {
+        s = s + "{s}"
+        i = i + 1
+    }
+    s
+}
+
+func one_pair(c: redis.Client, val: str) -> Result<int, redis.RError> {
+    _u9 := c.set("zz:ex:bench:get1k", val, 0)?
+    match c.get("zz:ex:bench:get1k") {
+        .ok(_) => .ok(0)
+        .err(e) => .err(e)
+    }
+}
+
+func run_once(c: redis.Client, val: str, n: int) -> Result<int, redis.RError> {
+    t0 := time.now_ms()
+    i := 0
+    while i < n {
+        _u8 := one_pair(c, val)?
+        i = i + 1
+    }
+    t1 := time.now_ms()
+    .ok(t1 - t0)
+}
+
+func insert_sorted(srt: [int], x: int) -> [int] {
+    out:[int] = []
+    done := false
+    for v in srt {
+        if done == false && x < v {
+            out = out.push(x)
+            done = true
+        }
+        out = out.push(v)
+    }
+    if done == false {
+        out = out.push(x)
+    }
+    out
+}
+
+func median5(a: int, b: int, c: int, d: int, e: int) -> int {
+    s1 := insert_sorted([], a)
+    s2 := insert_sorted(s1, b)
+    s3 := insert_sorted(s2, c)
+    s4 := insert_sorted(s3, d)
+    s5 := insert_sorted(s4, e)
+    s5[2]
+}
+
+func main() -> Result<int, redis.RError> {
+    c := redis.connect("redis://127.0.0.1:6379")?
+    v := kilo()
+    _u7 := c.del(["zz:ex:bench:get1k"])?
+    r0 := run_once(c, v, 100)?
+    r1 := run_once(c, v, 100)?
+    r2 := run_once(c, v, 100)?
+    r3 := run_once(c, v, 100)?
+    r4 := run_once(c, v, 100)?
+    m := median5(r0, r1, r2, r3, r4)
+    ops := 0
+    if m > 0 {
+        ops = 100 * 1000 / m
+    }
+    println("get1k ops=100 ms={m} ops_per_s={ops}")
+    _u1 := c.del(["zz:ex:bench:get1k"])?
+    _u2 := c.close()
+    .ok(0)
+}

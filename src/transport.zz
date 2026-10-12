@@ -1,0 +1,234 @@
+// transport.zz — the only view of the network (plan v3 §4).
+//
+// One struct covers TCP and TLS with the same method set; everything above
+// this file is transport-agnostic. Timeouts from Options apply at open;
+// per-command overrides live in client.zz (set/restore around calls).
+//
+// Notes:
+// - Single-read cap is 64MiB (toolchain read_exact/bytes.finish ceiling).
+//   Bulks declaring more fail closed with a loud protocol error; use
+//   GETRANGE for huge values. See DOCS.md "large values".
+// - `unix://` opens real Unix-domain sockets (toolchain net.unix_*).
+// - TLS errors arrive pre-classified (`tls:<reason>:`) from the toolchain;
+//   TCP messages are matched by keyword (see classify_io).
+import std.net
+import std.str
+
+import redis.errors as errors
+import redis.url as url
+
+// mode: 0 = TCP, 1 = TLS, 2 = Unix.
+pub struct Transport {
+    mode: int,
+    tcp: Option<tcp.stream>,
+    tl: Option<tls>,
+    ux: Option<unix>,
+    read_ms: int,
+    write_ms: int,
+}
+
+// Unreachable by construction (mode guards every call site); typed as
+// Result so an internal mismatch fails loudly, never silently.
+func tcp_of(t: Transport) -> Result<tcp.stream, errors.RError> {
+    match t.tcp {
+        .some(s) => .ok(s)
+        .none => .err(errors.protocol_error("transport mode/tcp mismatch (internal)"))
+    }
+}
+
+func tls_of(t: Transport) -> Result<tls, errors.RError> {
+    match t.tl {
+        .some(s) => .ok(s)
+        .none => .err(errors.protocol_error("transport mode/tls mismatch (internal)"))
+    }
+}
+
+// Map a raw IO failure message to the taxonomy. `during` is one of
+// connect|write|read|handshake; `addr` names the peer (never a secret).
+
+func classify_io(msg: str, during: str, addr: str) -> errors.RError {
+    if str.contains(msg, "tls:cert_untrusted") {
+        return errors.tls_error("cert_untrusted")
+    }
+    if str.contains(msg, "tls:cert_hostname") {
+        return errors.tls_error("cert_hostname")
+    }
+    if str.contains(msg, "tls:refused_tls") {
+        return errors.tls_error("refused_tls")
+    }
+    if str.contains(msg, "tls:timeout") {
+        return errors.timeout_error(during)
+    }
+    if str.contains(msg, "tls:") {
+        return errors.tls_error("handshake_failed")
+    }
+    if str.contains(msg, "timed out") {
+        return errors.timeout_error(during)
+    }
+    if str.contains(msg, "temporarily unavailable") {
+        return errors.timeout_error(during)
+    }
+    if str.contains(msg, "refused") {
+        return errors.conn_refused_error(addr)
+    }
+    if str.contains(msg, "closed") {
+        return errors.closed_error(during)
+    }
+    if str.contains(msg, "reset") || str.contains(msg, "broken pipe") {
+        return errors.closed_error(during)
+    }
+    errors.closed_error(during)
+}
+
+// Lift a native Result<T, str> into the taxonomy.
+
+func lift<T>(r: Result<T, str>, during: str, addr: str) -> Result<T, errors.RError> {
+    match r {
+        .ok(v) => .ok(v)
+        .err(e) => .err(classify_io(e, during, addr))
+    }
+}
+
+// Open a transport from validated Options (handshake lives in conn.zz).
+
+pub func open(o: url.Options) -> Result<Transport, errors.RError> {
+    if o.unix != "" {
+        match net.unix_connect(o.unix, o.connect_ms) {
+            .ok(s) => {
+                return unix_ready(s, o)
+            }
+            .err(e) => return .err(classify_io(e, "connect", o.unix))
+        }
+    }
+    addr := "{o.host}:{o.port}"
+    if o.tls {
+        server := o.tls_sni
+        if server == "" {
+            server = o.host
+        }
+        if o.tls_insecure {
+            match net.tls_connect_insecure(addr, server, o.connect_ms) {
+                .ok(s) => tls_ready(s, o, addr)
+                .err(e) => .err(classify_io(e, "connect", addr))
+            }
+        } else if o.tls_ca != "" {
+            match net.tls_connect_with_ca(addr, server, o.tls_ca, o.connect_ms) {
+                .ok(s) => tls_ready(s, o, addr)
+                .err(e) => .err(classify_io(e, "connect", addr))
+            }
+        } else {
+            match net.tls_connect(addr, server, o.connect_ms) {
+                .ok(s) => tls_ready(s, o, addr)
+                .err(e) => .err(classify_io(e, "connect", addr))
+            }
+        }
+    } else {
+        match net.tcp_connect(addr, o.connect_ms) {
+            .ok(s) => tcp_ready(s, o, addr)
+            .err(e) => .err(classify_io(e, "connect", addr))
+        }
+    }
+}
+
+func tcp_ready(s: tcp.stream, o: url.Options, addr: str) -> Result<Transport, errors.RError> {
+    lift(s.set_read_timeout(o.read_ms), "connect", addr)?
+    lift(s.set_write_timeout(o.write_ms), "connect", addr)?
+    .ok(Transport{mode: 0, tcp: .some(s), tl: .none, ux: .none, read_ms: o.read_ms, write_ms: o.write_ms})
+}
+
+func tls_ready(s: tls, o: url.Options, addr: str) -> Result<Transport, errors.RError> {
+    lift(s.set_read_timeout(o.read_ms), "connect", addr)?
+    lift(s.set_write_timeout(o.write_ms), "connect", addr)?
+    .ok(Transport{mode: 1, tcp: .none, tl: .some(s), ux: .none, read_ms: o.read_ms, write_ms: o.write_ms})
+}
+
+
+func unix_ready(s: unix, o: url.Options) -> Result<Transport, errors.RError> {
+    lift(s.set_read_timeout(o.read_ms), "connect", o.unix)?
+    lift(s.set_write_timeout(o.write_ms), "connect", o.unix)?
+    .ok(Transport{mode: 2, tcp: .none, tl: .none, ux: .some(s), read_ms: o.read_ms, write_ms: o.write_ms})
+}
+
+// Write the full buffer (natives loop to completion; short writes surface
+// as errors, never silent halves at this layer — pipelined partial-failure
+// accounting lives in pipe.zz).
+
+pub func write(t: Transport, b: bytes) -> Result<int, errors.RError> {
+    if t.mode == 1 {
+        return lift(tls_of(t)?.write_bytes(b), "write", "peer")
+    }
+    if t.mode == 2 {
+        return lift(ux_of(t)?.write_bytes(b), "write", "peer")
+    }
+    lift(tcp_of(t)?.write_bytes(b), "write", "peer")
+}
+
+// One CRLF-terminated line as str (replies are ASCII; bulk bodies never
+// flow through here — see read_exact).
+
+pub func read_line(t: Transport) -> Result<str, errors.RError> {
+    if t.mode == 1 {
+        return lift(tls_of(t)?.read_line(), "read", "peer")
+    }
+    if t.mode == 2 {
+        return lift(ux_of(t)?.read_line(), "read", "peer")
+    }
+    lift(tcp_of(t)?.read_line(), "read", "peer")
+}
+
+// Exactly n bytes (RESP bulk bodies incl. trailing CRLF). n <= 0 or over
+// the 64MiB single-read ceiling fails closed (see file header).
+
+pub func read_exact(t: Transport, n: int) -> Result<bytes, errors.RError> {
+    if n <= 0 {
+        return .err(errors.protocol_error("bad_length {n}"))
+    }
+    if n > 67108864 {
+        return .err(errors.protocol_error("bulk_too_large {n} (single-read ceiling 64MiB; use GETRANGE for huge values)"))
+    }
+    if t.mode == 1 {
+        return lift(tls_of(t)?.read_exact(n), "read", "peer")
+    }
+    if t.mode == 2 {
+        return lift(ux_of(t)?.read_exact(n), "read", "peer")
+    }
+    lift(tcp_of(t)?.read_exact(n), "read", "peer")
+}
+
+// Best-effort shutdown; always succeeds (idempotent).
+
+func ux_of(t: Transport) -> Result<unix, errors.RError> {
+    match t.ux {
+        .some(s) => .ok(s)
+        .none => .err(errors.protocol_error("transport mode/unix mismatch (internal)"))
+    }
+}
+
+pub func close(t: Transport) -> int {
+    if t.mode == 2 {
+        match t.ux {
+            .some(s) => {
+                _u := s.close()
+                return 0
+            }
+            .none => return 0
+        }
+    }
+    if t.mode == 1 {
+        match t.tl {
+            .some(s) => {
+                _ := s.close()
+                0
+            }
+            .none => 0
+        }
+    } else {
+        match t.tcp {
+            .some(s) => {
+                _ := s.close()
+                0
+            }
+            .none => 0
+        }
+    }
+}

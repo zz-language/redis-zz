@@ -1,0 +1,745 @@
+// resp.zz — RESP2/RESP3 command encoder and reply parser (plan v3 §9).
+//
+// Encoder: argv vectors become bulk-string frames only (*N / $len), which
+// is all Redis accepts for commands. Binary-safe: each arg length is the
+// BYTE count from str.bytes(arg), never len(arg) (chars). encode is total:
+// it returns bytes for every input, including [] (which encodes as *0).
+// Commands larger than the 64MiB bytes.finish cap degrade to *0 rather
+// than failing; chunk large payloads instead.
+//
+// Parser: offset-based over a caller-supplied [int] buffer. It never blocks
+// and never panics: reading past the end of buf yields
+// protocol_error("incomplete ...") so the conn layer knows to read more
+// bytes and retry. Every other grammar violation (bad lengths, missing
+// CRLF, limit breach, unknown prefix, bad UTF-8) is a protocol_error naming
+// the reason and the byte offset; the connection is then poisoned and must
+// be closed, never reused.
+//
+// Values live in an Arena: each node is an int id indexing parallel arrays
+// (tags/strs/ints/raws/starts/lens/kids). Aggregate children are stored
+// flat in kids; starts[id]/lens[id] delimit node id's slice (for maps the
+// slice is flat k,v,k,v pairs, so lens is twice the pair count). Arenas are
+// plain values: parse takes one by copy and returns the extended copy in
+// ParseOut. No recursive types, no aliasing, no panics on any path.
+import std.bytes
+import std.str
+
+import redis.errors as errors
+
+// Reply tags. R_NULL covers _, $-1 and *-1 (all three are the same nil).
+// RESP3 blob errors (!) have no tag: with no distinct shape to hang them
+// on they surface as protocol_error("unknown_type ..."), never a guess.
+pub const R_NULL: int = 0
+pub const R_SIMPLE: int = 1
+pub const R_ERROR: int = 2
+pub const R_INT: int = 3
+pub const R_BULK: int = 4
+pub const R_ARRAY: int = 5
+pub const R_MAP: int = 6
+pub const R_SET: int = 7
+pub const R_BOOL: int = 8
+pub const R_DOUBLE: int = 9
+pub const R_BIG: int = 10
+pub const R_VERB: int = 11
+pub const R_PUSH: int = 12
+pub const R_ATTR: int = 13
+
+// Arena of parsed values. Node id indexes every array in parallel; see the
+// file header for the kids/starts/lens layout. Only parse builds these, but
+// the struct is public so accessors defend against forged ids (slot_ok)
+// instead of ever indexing out of bounds.
+pub struct Arena {
+    tags: [int],
+    strs: [str],
+    ints: [int],
+    raws: [[int]],
+    starts: [int],
+    lens: [int],
+    kids: [int],
+}
+
+// Handle for one node in an Arena. The id is meaningless without its arena.
+pub struct Value {
+    id: int,
+}
+
+// parse result: the extended arena, the root node id, and the offset of the
+// first unconsumed byte (== len(buf) for an exact single-value buffer).
+pub struct ParseOut {
+    arena: Arena,
+    id: int,
+    next: int,
+}
+
+// Parser limits (plan §9 defaults via default_limits). max_bulk bounds one
+// bulk/verbatim payload, max_array bounds one aggregate's element count
+// (pair count for maps/attrs), max_depth bounds nesting, max_line bounds one
+// CRFF-terminated line. Any breach is a protocol_error, never truncation.
+pub struct Limits {
+    max_bulk: int,
+    max_array: int,
+    max_depth: int,
+    max_line: int,
+}
+
+// Safe defaults: 512MiB bulk (Redis's own cap), 1M elements, depth 32,
+// 64KiB lines.
+pub func default_limits() -> Limits {
+    Limits{max_bulk: 536870912, max_array: 1000000, max_depth: 32, max_line: 65536}
+}
+
+// Empty arena: no nodes, no kids.
+pub func new_arena() -> Arena {
+    Arena{tags: [], strs: [], ints: [], raws: [], starts: [], lens: [], kids: []}
+}
+
+// Encode argv as a bulk-string frame. Total: returns bytes for every input.
+pub func encode(args: [str]) -> bytes {
+    out:[int] = [42]
+    out = extend(out, decimal(len(args)))
+    out = extend(out, [13, 10])
+    for arg in args {
+        ab := str.bytes(arg)
+        out = out.push(36)
+        out = extend(out, decimal(len(ab)))
+        out = extend(out, [13, 10])
+        out = extend(out, ab)
+        out = extend(out, [13, 10])
+    }
+    match bytes.finish(out) {
+        .ok(b) => b
+        // Unreachable in practice: every value above is a valid byte, so
+        // only the 64MiB cap can fail, and the empty frame is 5 bytes and
+        // always succeeds — this terminates after one step and keeps
+        // encode total. Oversize commands degrade to *0 (chunk them).
+        .err(_) => encode([])
+    }
+}
+
+// Encode pre-built byte parts (first part is usually the command word).
+// Binary-safe end to end: lengths are raw byte counts, payloads pass
+// through untouched (any byte 0-255, including invalid UTF-8). Total
+// like encode (oversize degrades to *0).
+pub func encode_bytes(parts: [bytes]) -> bytes {
+    out:[int] = [42]
+    out = extend(out, decimal(len(parts)))
+    out = extend(out, [13, 10])
+    for part in parts {
+        pb := bytes.to_ints(part)
+        out = out.push(36)
+        out = extend(out, decimal(len(pb)))
+        out = extend(out, [13, 10])
+        out = extend(out, pb)
+        out = extend(out, [13, 10])
+    }
+    match bytes.finish(out) {
+        .ok(b) => b
+        .err(_) => encode([])
+    }
+}
+
+// str as a byte part (for mixing text commands with binary args).
+// Fails closed past the 64MiB single-frame ceiling (chunk instead).
+pub func str_part(s: str) -> Result<bytes, errors.RError> {
+    match bytes.finish(str.bytes(s)) {
+        .ok(b) => .ok(b)
+        .err(_) => .err(errors.protocol_error("frame_too_large"))
+    }
+}
+
+// Parse one value at buf[pos] with the given nesting depth. depth is 0 for a
+// top-level reply; children parse at depth+1 and depth > max_depth fails.
+pub func parse(a: Arena, buf: [int], pos: int, depth: int, lim: Limits) -> Result<ParseOut, errors.RError> {
+    if depth > lim.max_depth {
+        return .err(errors.protocol_error("max_depth {lim.max_depth} exceeded at offset {pos}"))
+    }
+    if pos < 0 {
+        return .err(errors.protocol_error("bad_offset {pos}"))
+    }
+    if pos >= len(buf) {
+        return .err(errors.protocol_error("incomplete at offset {pos}"))
+    }
+    t := buf[pos]
+    if t == 43 {
+        // + simple string
+        ln := read_line(buf, pos + 1, lim)?
+        match bytes.to_str(ln.line) {
+            .err(_) => .err(errors.protocol_error("bad_utf8 in simple string at offset {pos}"))
+            .ok(s) => {
+                n := text_node(a, R_SIMPLE, s)
+                .ok(ParseOut{arena: n.arena, id: n.id, next: ln.next})
+            }
+        }
+    } else if t == 45 {
+        // - error reply (MOVED/ASK stay verbatim here; the client maps them)
+        ln := read_line(buf, pos + 1, lim)?
+        match bytes.to_str(ln.line) {
+            .err(_) => .err(errors.protocol_error("bad_utf8 in error string at offset {pos}"))
+            .ok(s) => {
+                n := text_node(a, R_ERROR, s)
+                .ok(ParseOut{arena: n.arena, id: n.id, next: ln.next})
+            }
+        }
+    } else if t == 58 {
+        // : integer
+        ln := read_line(buf, pos + 1, lim)?
+        match parse_int_lit(ln.line) {
+            .err(_) => .err(errors.protocol_error("bad_int at offset {pos}"))
+            .ok(v) => {
+                empty:[int] = []
+                n := alloc(a, R_INT, "", v, empty, 0, 0)
+                .ok(ParseOut{arena: n.arena, id: n.id, next: ln.next})
+            }
+        }
+    } else if t == 36 {
+        // $ bulk string ($-1 is nil)
+        ln := read_line(buf, pos + 1, lim)?
+        match parse_int_lit(ln.line) {
+            .err(_) => .err(errors.protocol_error("bad_length at offset {pos}"))
+            .ok(n) => {
+                if n == -1 {
+                    nn := null_node(a)
+                    .ok(ParseOut{arena: nn.arena, id: nn.id, next: ln.next})
+                } else {
+                    match take_bulk(buf, ln.next, n, lim, pos) {
+                        .err(e) => .err(e)
+                        .ok(b) => {
+                            nd := alloc(a, R_BULK, "", 0, b.payload, 0, 0)
+                            .ok(ParseOut{arena: nd.arena, id: nd.id, next: b.next})
+                        }
+                    }
+                }
+            }
+        }
+    } else if t == 42 {
+        elems(a, buf, pos, depth, lim, R_ARRAY)
+    } else if t == 126 {
+        elems(a, buf, pos, depth, lim, R_SET)
+    } else if t == 62 {
+        elems(a, buf, pos, depth, lim, R_PUSH)
+    } else if t == 37 {
+        pairs(a, buf, pos, depth, lim, R_MAP)
+    } else if t == 124 {
+        pairs(a, buf, pos, depth, lim, R_ATTR)
+    } else if t == 95 {
+        // _ nil (exactly empty; anything else is a corrupt peer)
+        ln := read_line(buf, pos + 1, lim)?
+        if len(ln.line) != 0 {
+            return .err(errors.protocol_error("bad_null at offset {pos}"))
+        }
+        n := null_node(a)
+        .ok(ParseOut{arena: n.arena, id: n.id, next: ln.next})
+    } else if t == 35 {
+        // # boolean: exactly t or f
+        ln := read_line(buf, pos + 1, lim)?
+        if len(ln.line) != 1 {
+            return .err(errors.protocol_error("bad_bool at offset {pos}"))
+        }
+        c := ln.line[0]
+        if c != 116 && c != 102 {
+            return .err(errors.protocol_error("bad_bool at offset {pos}"))
+        }
+        v := 0
+        if c == 116 {
+            v = 1
+        }
+        empty:[int] = []
+        n := alloc(a, R_BOOL, "", v, empty, 0, 0)
+        .ok(ParseOut{arena: n.arena, id: n.id, next: ln.next})
+    } else if t == 44 {
+        // , double (kept as text; no float semantics in the parser)
+        ln := read_line(buf, pos + 1, lim)?
+        match bytes.to_str(ln.line) {
+            .err(_) => .err(errors.protocol_error("bad_utf8 in double at offset {pos}"))
+            .ok(s) => {
+                n := text_node(a, R_DOUBLE, s)
+                .ok(ParseOut{arena: n.arena, id: n.id, next: ln.next})
+            }
+        }
+    } else if t == 40 {
+        // ( big number (kept as text; may exceed i64)
+        ln := read_line(buf, pos + 1, lim)?
+        match bytes.to_str(ln.line) {
+            .err(_) => .err(errors.protocol_error("bad_utf8 in big number at offset {pos}"))
+            .ok(s) => {
+                n := text_node(a, R_BIG, s)
+                .ok(ParseOut{arena: n.arena, id: n.id, next: ln.next})
+            }
+        }
+    } else if t == 61 {
+        // = verbatim string (ext prefix "xxx:" skipped, content kept)
+        ln := read_line(buf, pos + 1, lim)?
+        match parse_int_lit(ln.line) {
+            .err(_) => .err(errors.protocol_error("bad_length at offset {pos}"))
+            .ok(n) => match take_bulk(buf, ln.next, n, lim, pos) {
+                .err(e) => .err(e)
+                .ok(b) => {
+                    if len(b.payload) < 4 || b.payload[3] != 58 {
+                        .err(errors.protocol_error("bad_verbatim ext at offset {pos}"))
+                    } else {
+                        nd := alloc(a, R_VERB, "", 0, b.payload[4:], 0, 0)
+                        .ok(ParseOut{arena: nd.arena, id: nd.id, next: b.next})
+                    }
+                }
+            }
+        }
+    } else {
+        .err(errors.protocol_error("unknown_type byte {t} at offset {pos}"))
+    }
+}
+
+// Tag of a node, or -1 for a forged id (never a panic).
+pub func tag_of(a: Arena, v: Value) -> int {
+    if slot_ok(a, v.id) {
+        return a.tags[v.id]
+    }
+    -1
+}
+
+// True only for R_NULL nodes (_, $-1, *-1).
+pub func is_null(a: Arena, v: Value) -> bool {
+    slot_ok(a, v.id) && a.tags[v.id] == R_NULL
+}
+
+// Simple or bulk as str. Bulk payloads decode as strict UTF-8: invalid
+// bytes are a protocol_error, never lossy replacement.
+pub func as_str(a: Arena, v: Value) -> Result<str, errors.RError> {
+    id := need_id(a, v)?
+    t := a.tags[id]
+    if t == R_SIMPLE {
+        return .ok(a.strs[id])
+    }
+    if t == R_BULK {
+        match bytes.to_str(a.raws[id]) {
+            .ok(s) => return .ok(s)
+            .err(_) => return .err(errors.protocol_error("bad_utf8 in bulk value {id}"))
+        }
+    }
+    .err(errors.protocol_error("unexpected_type: as_str needs simple or bulk, got tag {t}"))
+}
+
+// Bulk or simple as raw bytes (simple re-encodes to bytes).
+pub func as_bytes(a: Arena, v: Value) -> Result<[int], errors.RError> {
+    id := need_id(a, v)?
+    t := a.tags[id]
+    if t == R_BULK {
+        return .ok(a.raws[id])
+    }
+    if t == R_SIMPLE {
+        return .ok(str.bytes(a.strs[id]))
+    }
+    .err(errors.protocol_error("unexpected_type: as_bytes needs bulk or simple, got tag {t}"))
+}
+
+// Integer or boolean (0/1). Strict: integer-valued bulks are rejected, use
+// as_str and convert at the call site instead.
+pub func as_int(a: Arena, v: Value) -> Result<int, errors.RError> {
+    id := need_id(a, v)?
+    t := a.tags[id]
+    if t == R_INT || t == R_BOOL {
+        return .ok(a.ints[id])
+    }
+    .err(errors.protocol_error("unexpected_type: as_int needs int or bool, got tag {t}"))
+}
+
+// Array, set or push members in order (push keeps its tag). Maps are
+// rejected: use as_map for the flat pair slice.
+pub func as_array(a: Arena, v: Value) -> Result<[Value], errors.RError> {
+    id := need_id(a, v)?
+    t := a.tags[id]
+    if t == R_MAP || t == R_ATTR {
+        return .err(errors.protocol_error("unexpected_type: as_array rejects map/attr, use as_map (got tag {t})"))
+    }
+    if t != R_ARRAY && t != R_SET && t != R_PUSH {
+        return .err(errors.protocol_error("unexpected_type: as_array needs array/set/push, got tag {t}"))
+    }
+    kids_of(a, id)
+}
+
+// Map or attr as a flat [k0, v0, k1, v1, ...] slice.
+pub func as_map(a: Arena, v: Value) -> Result<[Value], errors.RError> {
+    id := need_id(a, v)?
+    t := a.tags[id]
+    if t != R_MAP && t != R_ATTR {
+        return .err(errors.protocol_error("unexpected_type: as_map needs map/attr, got tag {t}"))
+    }
+    kids_of(a, id)
+}
+
+// Error reply text (without the leading -).
+pub func err_text(a: Arena, v: Value) -> Result<str, errors.RError> {
+    id := need_id(a, v)?
+    t := a.tags[id]
+    if t == R_ERROR {
+        return .ok(a.strs[id])
+    }
+    .err(errors.protocol_error("unexpected_type: err_text needs error, got tag {t}"))
+}
+
+// Structural equality across arenas (possibly different ones). Tags must
+// match, then payloads, then children pairwise. Forged ids compare false,
+// never panic.
+pub func deep_equal(a: Arena, v: Value, b: Arena, w: Value) -> bool {
+    if slot_ok(a, v.id) == false {
+        return false
+    }
+    if slot_ok(b, w.id) == false {
+        return false
+    }
+    ta := a.tags[v.id]
+    tb := b.tags[w.id]
+    if ta != tb {
+        return false
+    }
+    if ta == R_NULL {
+        return true
+    }
+    if ta == R_INT || ta == R_BOOL {
+        return a.ints[v.id] == b.ints[w.id]
+    }
+    if ta == R_SIMPLE || ta == R_ERROR || ta == R_DOUBLE || ta == R_BIG {
+        return a.strs[v.id] == b.strs[w.id]
+    }
+    if ta == R_BULK || ta == R_VERB {
+        return a.raws[v.id] == b.raws[w.id]
+    }
+    sta := a.starts[v.id]
+    lna := a.lens[v.id]
+    stb := b.starts[w.id]
+    lnb := b.lens[w.id]
+    if lna != lnb {
+        return false
+    }
+    if lna < 0 || sta < 0 || stb < 0 {
+        return false
+    }
+    if sta > len(a.kids) || lna > len(a.kids) - sta {
+        return false
+    }
+    if stb > len(b.kids) || lnb > len(b.kids) - stb {
+        return false
+    }
+    i := 0
+    while i < lna {
+        ka := a.kids[sta + i]
+        kb := b.kids[stb + i]
+        if deep_equal(a, wrap_value(ka), b, wrap_value(kb)) == false {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+// One CRLF-terminated line starting just after the prefix byte at pos-1.
+// The line content (without CRLF) plus the offset past CRLF. A missing
+// terminator is incomplete (more bytes may complete it); a lone CR followed
+// by anything but LF is corrupt; lines past max_line are rejected even when
+// the buffer holds more.
+struct LineOut {
+    line: [int],
+    next: int,
+}
+
+func read_line(buf: [int], pos: int, lim: Limits) -> Result<LineOut, errors.RError> {
+    i := pos
+    while i < len(buf) {
+        if i - pos > lim.max_line {
+            return .err(errors.protocol_error("max_line {lim.max_line} exceeded at offset {pos}"))
+        }
+        if buf[i] == 13 {
+            if i + 1 >= len(buf) {
+                return .err(errors.protocol_error("incomplete at offset {pos}"))
+            }
+            if buf[i + 1] != 10 {
+                return .err(errors.protocol_error("missing_crlf at offset {i}"))
+            }
+            return .ok(LineOut{line: buf[pos:i], next: i + 2})
+        }
+        i = i + 1
+    }
+    .err(errors.protocol_error("incomplete at offset {pos}"))
+}
+
+// Strict ASCII integer with manual i64 overflow detection (ZZ ints wrap
+// silently, so the bound is checked digit by digit). Leading + or - is
+// allowed; at least one digit is required.
+func parse_int_lit(d: [int]) -> Result<int, str> {
+    if len(d) == 0 {
+        return .err("empty integer")
+    }
+    neg := false
+    i := 0
+    if d[0] == 43 {
+        i = 1
+    } else if d[0] == 45 {
+        neg = true
+        i = 1
+    }
+    if i >= len(d) {
+        return .err("sign without digits")
+    }
+    v := 0
+    while i < len(d) {
+        c := d[i]
+        if c < 48 || c > 57 {
+            return .err("bad digit")
+        }
+        dig := c - 48
+        if neg {
+            if v < -922337203685477580 {
+                return .err("integer overflow")
+            }
+            if v == -922337203685477580 && dig > 8 {
+                return .err("integer overflow")
+            }
+            v = v * 10 - dig
+        } else {
+            if v > 922337203685477580 {
+                return .err("integer overflow")
+            }
+            if v == 922337203685477580 && dig > 7 {
+                return .err("integer overflow")
+            }
+            v = v * 10 + dig
+        }
+        i = i + 1
+    }
+    .ok(v)
+}
+
+// Payload take for $ and = : n checked against the cap, then bounds (short
+// reads are incomplete), then the trailing CRLF must be present bytes.
+struct BulkOut {
+    payload: [int],
+    next: int,
+}
+
+func take_bulk(buf: [int], at: int, n: int, lim: Limits, pos: int) -> Result<BulkOut, errors.RError> {
+    if n < 0 {
+        return .err(errors.protocol_error("bad_length negative at offset {pos}"))
+    }
+    if n > lim.max_bulk {
+        return .err(errors.protocol_error("max_bulk {lim.max_bulk} exceeded by {n} at offset {pos}"))
+    }
+    if n > len(buf) {
+        return .err(errors.protocol_error("incomplete at offset {pos}"))
+    }
+    if at + n + 2 > len(buf) {
+        return .err(errors.protocol_error("incomplete at offset {pos}"))
+    }
+    if buf[at + n] != 13 || buf[at + n + 1] != 10 {
+        return .err(errors.protocol_error("missing_crlf at offset {pos}"))
+    }
+    .ok(BulkOut{payload: buf[at:at + n], next: at + n + 2})
+}
+
+// *-style aggregate (array/set/push): n elements. Only arrays admit -1
+// (nil); sets and pushes reject negatives.
+func elems(a: Arena, buf: [int], pos: int, depth: int, lim: Limits, tag: int) -> Result<ParseOut, errors.RError> {
+    ln := read_line(buf, pos + 1, lim)?
+    match parse_int_lit(ln.line) {
+        .err(_) => .err(errors.protocol_error("bad_length at offset {pos}"))
+        .ok(n) => {
+            if n == -1 && tag == R_ARRAY {
+                nn := null_node(a)
+                .ok(ParseOut{arena: nn.arena, id: nn.id, next: ln.next})
+            } else if n < 0 {
+                .err(errors.protocol_error("bad_length negative at offset {pos}"))
+            } else if n > lim.max_array {
+                .err(errors.protocol_error("max_array {lim.max_array} exceeded by {n} at offset {pos}"))
+            } else {
+                match parse_kids(a, buf, ln.next, depth, lim, n) {
+                    .err(e) => .err(e)
+                    .ok(s) => {
+                        empty:[int] = []
+                        base := len(s.arena.kids)
+                        na := s.arena
+                        for kid in s.kids {
+                            na.kids = extend(na.kids, [kid])
+                        }
+                        nd := alloc(na, tag, "", 0, empty, base, n)
+                        .ok(ParseOut{arena: nd.arena, id: nd.id, next: s.next})
+                    }
+                }
+            }
+        }
+    }
+}
+
+// %-style aggregate (map/attr): n pairs, 2n children flat. -1 is never nil
+// here (RESP3 nil is _).
+func pairs(a: Arena, buf: [int], pos: int, depth: int, lim: Limits, tag: int) -> Result<ParseOut, errors.RError> {
+    ln := read_line(buf, pos + 1, lim)?
+    match parse_int_lit(ln.line) {
+        .err(_) => .err(errors.protocol_error("bad_length at offset {pos}"))
+        .ok(n) => {
+            if n < 0 {
+                .err(errors.protocol_error("bad_length negative at offset {pos}"))
+            } else if n > lim.max_array {
+                .err(errors.protocol_error("max_array {lim.max_array} exceeded by {n} at offset {pos}"))
+            } else {
+                match parse_kids(a, buf, ln.next, depth, lim, n * 2) {
+                    .err(e) => .err(e)
+                    .ok(s) => {
+                        empty:[int] = []
+                        base := len(s.arena.kids)
+                        na := s.arena
+                        for kid in s.kids {
+                            na.kids = extend(na.kids, [kid])
+                        }
+                        nd := alloc(na, tag, "", 0, empty, base, n * 2)
+                        .ok(ParseOut{arena: nd.arena, id: nd.id, next: s.next})
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Parse exactly n children, threading the arena. The first child failure
+// aborts the whole aggregate (framing: a short child is incomplete).
+struct SeqOut {
+    arena: Arena,
+    kids: [int],
+    next: int,
+}
+
+func parse_kids(a: Arena, buf: [int], pos: int, depth: int, lim: Limits, n: int) -> Result<SeqOut, errors.RError> {
+    kids:[int] = []
+    cur_a := a
+    cur_p := pos
+    count := 0
+    while count < n {
+        match parse(cur_a, buf, cur_p, depth + 1, lim) {
+            .ok(o) => {
+                cur_a = o.arena
+                cur_p = o.next
+                kids = kids.push(o.id)
+                count = count + 1
+            }
+            .err(e) => {
+                return .err(e)
+            }
+        }
+    }
+    .ok(SeqOut{arena: cur_a, kids: kids, next: cur_p})
+}
+
+// Node with every array present: id is the pre-push length, so all seven
+// arrays stay parallel and slot_ok holds for everything parse builds.
+struct NodeOut {
+    arena: Arena,
+    id: int,
+}
+
+func alloc(a: Arena, tag: int, s: str, n: int, raw: [int], st: int, ln: int) -> NodeOut {
+    id := len(a.tags)
+    // NOTE: plain-function routing (extend/push_raw), never a.tags.push(..):
+    // the native backend drops method calls made directly on struct fields.
+    a.tags = extend(a.tags, [tag])
+    a.strs = extend_str(a.strs, s)
+    a.ints = extend(a.ints, [n])
+    a.raws = push_raw(a.raws, raw)
+    a.starts = extend(a.starts, [st])
+    a.lens = extend(a.lens, [ln])
+    NodeOut{arena: a, id: id}
+}
+
+// Leaf with text payload (simple/error/double/big).
+func text_node(a: Arena, tag: int, s: str) -> NodeOut {
+    empty:[int] = []
+    alloc(a, tag, s, 0, empty, 0, 0)
+}
+
+// Leaf with no payload (_, $-1, *-1).
+func null_node(a: Arena) -> NodeOut {
+    empty:[int] = []
+    alloc(a, R_NULL, "", 0, empty, 0, 0)
+}
+
+// Every parallel array must hold id; parse-built arenas always satisfy this,
+// forged ones may not, and no accessor may index without it.
+func slot_ok(a: Arena, id: int) -> bool {
+    id >= 0 && id < len(a.tags) && id < len(a.strs) && id < len(a.ints) && id < len(a.raws) && id < len(a.starts) && id < len(a.lens)
+}
+
+// Validated node id for fallible accessors.
+func need_id(a: Arena, v: Value) -> Result<int, errors.RError> {
+    if slot_ok(a, v.id) {
+        return .ok(v.id)
+    }
+    .err(errors.protocol_error("bad_value_id {v.id}"))
+}
+
+// Aggregate children as Values. The starts/lens/kids triple is re-checked
+// here (wrap-safe: st and ln are each bounded by len(kids), so st+i cannot
+// overflow past the end).
+func kids_of(a: Arena, id: int) -> Result<[Value], errors.RError> {
+    st := a.starts[id]
+    ln := a.lens[id]
+    if st < 0 || ln < 0 || st > len(a.kids) || ln > len(a.kids) - st {
+        return .err(errors.protocol_error("bad_arena children out of range at id {id}"))
+    }
+    out:[Value] = []
+    i := 0
+    while i < ln {
+        kid := a.kids[st + i]
+        if slot_ok(a, kid) == false {
+            return .err(errors.protocol_error("bad_arena child id {kid} missing at id {id}"))
+        }
+        out = out.push(wrap_value(kid))
+        i = i + 1
+    }
+    .ok(out)
+}
+
+// One-element Value constructor as a call (not an inline literal): the
+// native backend boxes call results into arrays but not inline struct
+// literals in push position, so kids_of must go through here.
+func wrap_value(kid: int) -> Value {
+    Value{id: kid}
+}
+
+// Non-negative integer as decimal bytes (lengths only; no sign needed).
+func decimal(n: int) -> [int] {
+    if n == 0 {
+        return [48]
+    }
+    rev:[int] = []
+    m := n
+    while m > 0 {
+        rev = rev.push(m % 10 + 48)
+        m = m / 10
+    }
+    out:[int] = []
+    i := len(rev) - 1
+    while i >= 0 {
+        out = out.push(rev[i])
+        i = i - 1
+    }
+    out
+}
+
+// Array concat (ZZ has no + on arrays): returns dst with src appended.
+func extend(dst: [int], src: [int]) -> [int] {
+    for x in src {
+        dst = dst.push(x)
+    }
+    dst
+}
+
+// Push one payload onto the raws array. Plain function (not a method on the
+// field) for the same native-backend reason as extend in alloc.
+func push_raw(dst: [[int]], one: [int]) -> [[int]] {
+    out:[[int]] = dst
+    out = out.push(one)
+    out
+}
+
+// Push one string onto a [str] array (extend is [int]-only).
+func extend_str(dst: [str], one: str) -> [str] {
+    out:[str] = dst
+    out = out.push(one)
+    out
+}

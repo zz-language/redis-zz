@@ -1,0 +1,190 @@
+// redis.zz — the only file users import (plan v3 §5, §6).
+//
+// Thin root over the submodules: type aliases erase to the real types,
+// free functions forward to Client methods. `import redis` gives
+// `redis.connect`, `redis.Options`, `c.get`, ... — one stable surface.
+import redis.client as client
+import redis.cmds as cmds
+import redis.conn as conn
+import redis.errors as errors
+import redis.hooks as hooks
+import redis.pipe as pipemod
+import redis.pool as pool
+import redis.resp as resp
+import redis.retry as retry
+import redis.transport as transport
+import redis.url as url
+
+pub type Options = url.Options
+
+pub type Client = client.Client
+
+pub type Reply = conn.Reply
+
+pub type Value = resp.Value
+
+pub type Arena = resp.Arena
+
+pub type RError = errors.RError
+
+pub type Transport = transport.Transport
+
+pub type Hooks = hooks.Hooks
+
+pub type Pool = pool.Pool
+
+pub type PoolStats = pool.PoolStats
+
+pub type PipeOut = pipemod.PipeOut
+
+pub func connect(raw: str) -> Result<Client, RError> {
+    client.connect(raw)
+}
+
+pub func connect_with(o: Options) -> Result<Client, RError> {
+    client.connect_with(o)
+}
+
+pub func parse_url(raw: str) -> Result<Options, RError> {
+    url.parse(raw)
+}
+
+pub func message(e: RError) -> str {
+    errors.message(e)
+}
+
+pub func do(cli: Client, cmd: str, args: [str]) -> Result<Reply, RError> {
+    cli.do(cmd, args)
+}
+
+pub func get(cli: Client, key: str) -> Result<Option<str>, RError> {
+    cli.get(key)
+}
+
+pub func set(cli: Client, key: str, val: str, ttl: int) -> Result<int, RError> {
+    cli.set(key, val, ttl)
+}
+
+pub func del(cli: Client, keys: [str]) -> Result<int, RError> {
+    cli.del(keys)
+}
+
+pub func exists(cli: Client, key: str) -> Result<int, RError> {
+    cli.exists(key)
+}
+
+pub func expire(cli: Client, key: str, ttl: int) -> Result<int, RError> {
+    cli.expire(key, ttl)
+}
+
+pub func ttl(cli: Client, key: str) -> Result<int, RError> {
+    cli.ttl(key)
+}
+
+pub func incr(cli: Client, key: str) -> Result<int, RError> {
+    cli.incr(key)
+}
+
+pub func mget(cli: Client, keys: [str]) -> Result<[Option<str>], RError> {
+    cli.mget(keys)
+}
+
+pub func ping(cli: Client) -> Result<str, RError> {
+    cli.ping()
+}
+
+pub func publish(cli: Client, channel: str, payload: str) -> Result<int, RError> {
+    cli.publish(channel, payload)
+}
+
+pub func close(cli: Client) -> int {
+    cli.close()
+}
+
+pub func idempotent(cmd: str, nargs: int) -> bool {
+    client.idempotent(cmd, nargs)
+}
+
+pub func version() -> str {
+    cmds.version()
+}
+
+pub func do_bytes(cli: Client, cmd: str, args: [bytes]) -> Result<Reply, RError> {
+    cli.do_bytes(cmd, args)
+}
+
+pub func set_bytes(cli: Client, key: str, val: bytes) -> Result<int, RError> {
+    cli.set_bytes(key, val)
+}
+
+pub func get_bytes(cli: Client, key: str) -> Result<Option<[int]>, RError> {
+    cli.get_bytes(key)
+}
+
+pub func no_hooks() -> Hooks {
+    hooks.no_hooks()
+}
+
+pub func backoff_ms(attempt: int) -> int {
+    retry.backoff_ms(attempt)
+}
+
+pub func retryable(f: func() -> Result<int, RError>, tries: int) -> func() -> Result<int, RError> {
+    retry.retryable(f, tries)
+}
+
+pub func timed(name: str, f: func() -> Result<int, RError>, hook: Hooks) -> Result<int, RError> {
+    retry.timed(name, f, hook)
+}
+
+pub func pool_open(o: Options) -> Result<Pool, RError> {
+    pool.open(o)
+}
+
+pub func pool_checkout(p: Pool, wait_ms: int) -> Result<int, RError> {
+    pool.checkout(p, wait_ms)
+}
+
+pub func pool_checkin(p: Pool, idx: int) -> int {
+    pool.checkin(p, idx)
+}
+
+pub func pool_conn(p: Pool, idx: int) -> Result<Client, RError> {
+    pool.conn_at(p, idx)
+}
+
+pub func pool_rotate(p: Pool, idx: int) -> Result<int, RError> {
+    pool.rotate(p, idx)
+}
+
+pub func pool_pinned(p: Pool, wait_ms: int) -> Result<int, RError> {
+    pool.pinned(p, wait_ms)
+}
+
+pub func pool_with(p: Pool, cmd: str, args: [str], idem: bool, timeout_ms: int) -> Result<Reply, RError> {
+    pool.with(p, cmd, args, idem, timeout_ms)
+}
+
+pub func pool_stats(p: Pool) -> PoolStats {
+    pool.stats(p)
+}
+
+pub func pool_close(p: Pool) -> int {
+    pool.close(p)
+}
+
+pub func pipe(c: Client, commands: [[str]]) -> Result<PipeOut, RError> {
+    pipemod.pipe(c, commands)
+}
+
+pub func multi(c: Client, commands: [[str]]) -> Result<[Reply], RError> {
+    pipemod.multi(c, commands)
+}
+
+pub func watch(c: Client, keys: [str]) -> Result<int, RError> {
+    pipemod.watch(c, keys)
+}
+
+pub func unwatch(c: Client) -> Result<int, RError> {
+    pipemod.unwatch(c)
+}

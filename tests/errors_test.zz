@@ -1,0 +1,93 @@
+// errors_test.zz — unit tests for the RError taxonomy.
+// Pure values only: safe under `zz test` in CI, both engines.
+import redis.errors as errors
+
+@test
+func kinds_are_exact() {
+    assert(errors.url_error("missing_host", "").kind == "url")
+    assert(errors.conn_refused_error("h:1").kind == "conn_refused")
+    assert(errors.timeout_error("read").kind == "timeout")
+    assert(errors.closed_error("idle").kind == "closed")
+    assert(errors.protocol_error("x").kind == "protocol")
+    assert(errors.redis_error("OOM", "m").kind == "redis")
+    assert(errors.moved_error(1, "h:1").kind == "moved")
+    assert(errors.ask_error(1, "h:1").kind == "ask")
+    assert(errors.auth_error("r").kind == "auth")
+    assert(errors.tls_error("timeout").kind == "tls")
+    assert(errors.conflict_error().kind == "conflict")
+    assert(errors.ambiguous_error("GET").kind == "ambiguous")
+    assert(errors.pool_error(50).kind == "pool_exhausted")
+}
+
+@test
+func message_format_is_kind_detail_hint() {
+    e := errors.timeout_error("connect")
+    assert_eq(errors.message(e), "timeout(connect): connect timed out: raise connect_timeout_ms or check the server is reachable")
+    m := errors.moved_error(5, "h:1")
+    assert_eq(errors.message(m), "moved(5 h:1): slot 5 moved to h:1: resend the command there (cluster routing lands in v2)")
+    r := errors.redis_error("WRONGTYPE", "nope")
+    assert_eq(errors.message(r), "redis(WRONGTYPE: nope): WRONGTYPE: the key holds a different type, use the matching command or DEL it first")
+}
+
+@test
+func url_detail_composes_segment_and_context() {
+    e := errors.url_error("db_out_of_range", "\"16\", expected 0-15")
+    assert_eq(e.detail, "db_out_of_range \"16\", expected 0-15")
+    bare := errors.url_error("missing_host", "")
+    assert_eq(bare.detail, "missing_host")
+}
+
+@test
+func is_io_covers_retriable_transports_only() {
+    assert(errors.is_io(errors.conn_refused_error("h:1")))
+    assert(errors.is_io(errors.timeout_error("read")))
+    assert(errors.is_io(errors.closed_error("command")))
+    assert(errors.is_io(errors.tls_error("refused_tls")))
+    assert(errors.is_io(errors.url_error("missing_host", "")) == false)
+    assert(errors.is_io(errors.auth_error("bad")) == false)
+    assert(errors.is_io(errors.protocol_error("x")) == false)
+    assert(errors.is_io(errors.redis_error("BUSY", "m")) == false)
+    assert(errors.is_io(errors.moved_error(0, "h:1")) == false)
+    assert(errors.is_io(errors.ask_error(0, "h:1")) == false)
+    assert(errors.is_io(errors.conflict_error()) == false)
+    assert(errors.is_io(errors.ambiguous_error("INCR")) == false)
+    assert(errors.is_io(errors.pool_error(1)) == false)
+}
+
+@test
+func every_constructor_gives_a_fix_hint() {
+    assert(errors.url_error("unsupported_scheme", "x").hint != "")
+    assert(errors.url_error("unknown_param", "x").hint != "")
+    assert(errors.url_error("empty_password", "").hint != "")
+    assert(errors.url_error("mystery_segment", "").hint != "")
+    assert(errors.conn_refused_error("h:1").hint != "")
+    assert(errors.timeout_error("write").hint != "")
+    assert(errors.timeout_error("handshake").hint != "")
+    assert(errors.timeout_error("bogus_phase").hint != "")
+    assert(errors.closed_error("subscribe").hint != "")
+    assert(errors.protocol_error("missing_crlf").hint != "")
+    assert(errors.redis_error("LOADING", "m").hint != "")
+    assert(errors.redis_error("READONLY", "m").hint != "")
+    assert(errors.redis_error("BUSY", "m").hint != "")
+    assert(errors.redis_error("NOSCRIPT", "m").hint != "")
+    assert(errors.redis_error("OOM", "m").hint != "")
+    assert(errors.redis_error("CUSTOM", "m").hint != "")
+    assert(errors.moved_error(0, "a").hint != "")
+    assert(errors.ask_error(0, "a").hint != "")
+    assert(errors.auth_error("bad pass").hint != "")
+    assert(errors.tls_error("cert_untrusted").hint != "")
+    assert(errors.conflict_error().hint != "")
+    assert(errors.ambiguous_error("SET").hint != "")
+    assert(errors.pool_error(200).hint != "")
+}
+
+@test
+func constructors_take_no_passwords() {
+    // Secret-leak audit: RError has exactly three fields and message()
+    // renders only kind/detail/hint, so a password can only appear if the
+    // caller puts it in `detail` — constructors offer no password slot.
+    e := errors.auth_error("wrong password for user alice")
+    assert_eq(errors.message(e), "auth(wrong password for user alice): auth failed: check user/password (ACL) and URL-encoding; auth failures are never retried")
+    p := errors.pool_error(120)
+    assert_eq(p.detail, "120ms")
+}

@@ -1,0 +1,212 @@
+// cmds.zz — typed commands over the generic do() path (plan v3 §6).
+//
+// Methods on client.Client (cross-module impl; every method is pub so
+// user code can call it). Every helper is a thin wrapper: one do() call,
+// one reply mapping. Miss is None, never an error. WRONGTYPE and friends
+// surface as redis_error.
+import redis.client as client
+import redis.conn as conn
+import redis.errors as errors
+import redis.resp as resp
+
+// Package version (mirrors zz.toml; sent as LIB-VER in handshakes).
+pub func version() -> str {
+    "0.1.0"
+}
+
+impl client.Client {
+    // Generic path — public, stable, the extension point. Unknown commands
+    // are NOT idempotent unless idempotent=true is passed explicitly.
+    pub func do(self, cmd: str, args: [str]) -> Result<conn.Reply, errors.RError> {
+        full := [cmd]
+        for a in args {
+            full = full.push(a)
+        }
+        idem := client.idempotent(cmd, args.len())
+        client.exchange(self, full, idem, 0)
+    }
+
+    pub func do_with(self, cmd: str, args: [str], idem: bool, timeout_ms: int) -> Result<conn.Reply, errors.RError> {
+        full := [cmd]
+        for a in args {
+            full = full.push(a)
+        }
+        client.exchange(self, full, idem, timeout_ms)
+    }
+
+    // GET: miss is None.
+    pub func get(self, key: str) -> Result<Option<str>, errors.RError> {
+        match self.do("GET", [key]) {
+            .ok(r) => {
+                if resp.is_null(r.arena, conn.reply_value(r)) {
+                    .ok(.none)
+                } else {
+                    match str_of(r) {
+                        .ok(s) => .ok(.some(s))
+                        .err(e) => .err(e)
+                    }
+                }
+            }
+            .err(e) => .err(e)
+        }
+    }
+
+    // SET key value [EX ttl]: ttl 0 (or absent) = no expiry. Forms with
+    // options are non-idempotent (safe direction — see idempotent()).
+    pub func set(self, key: str, val: str, ttl: int) -> Result<int, errors.RError> {
+        if ttl > 0 {
+            match self.do("SET", [key, val, "EX", "{ttl}"]) {
+                .ok(_) => .ok(0)
+                .err(e) => .err(e)
+            }
+        } else {
+            match self.do("SET", [key, val]) {
+                .ok(_) => .ok(0)
+                .err(e) => .err(e)
+            }
+        }
+    }
+
+    pub func del(self, keys: [str]) -> Result<int, errors.RError> {
+        args := ["DEL"]
+        for k in keys {
+            args = args.push(k)
+        }
+        match client.exchange(self, args, true, 0) {
+            .ok(r) => int_of(r)
+            .err(e) => .err(e)
+        }
+    }
+
+    pub func exists(self, key: str) -> Result<int, errors.RError> {
+        match self.do("EXISTS", [key]) {
+            .ok(r) => int_of(r)
+            .err(e) => .err(e)
+        }
+    }
+
+    pub func expire(self, key: str, ttl: int) -> Result<int, errors.RError> {
+        match self.do("EXPIRE", [key, "{ttl}"]) {
+            .ok(r) => int_of(r)
+            .err(e) => .err(e)
+        }
+    }
+
+    pub func ttl(self, key: str) -> Result<int, errors.RError> {
+        match self.do("TTL", [key]) {
+            .ok(r) => int_of(r)
+            .err(e) => .err(e)
+        }
+    }
+
+    pub func incr(self, key: str) -> Result<int, errors.RError> {
+        match self.do("INCR", [key]) {
+            .ok(r) => int_of(r)
+            .err(e) => .err(e)
+        }
+    }
+
+    pub func ping(self) -> Result<str, errors.RError> {
+        match self.do("PING", []) {
+            .ok(r) => str_of(r)
+            .err(e) => .err(e)
+        }
+    }
+
+    // MGET: per-slot miss is None (never an error); a per-slot server
+    // error fails the whole call loudly.
+    pub func mget(self, keys: [str]) -> Result<[Option<str>], errors.RError> {
+        args := ["MGET"]
+        for k in keys {
+            args = args.push(k)
+        }
+        match client.exchange(self, args, true, 0) {
+            .ok(r) => {
+                match resp.as_array(r.arena, conn.reply_value(r)) {
+                    .ok(vs) => collect_opts(r.arena, vs)
+                    .err(e) => .err(e)
+                }
+            }
+            .err(e) => .err(e)
+        }
+    }
+
+    pub func close(self) -> int {
+        client.close(self)
+    }
+
+    // Binary path: unknown commands are never idempotent here (safe
+    // direction); pass idempotent=true via do_with_bytes when the
+    // command is known idempotent.
+    pub func do_bytes(self, cmd: str, args: [bytes]) -> Result<conn.Reply, errors.RError> {
+        client.exchange_bytes(self, cmd, args, false, 0)
+    }
+
+    pub func do_with_bytes(self, cmd: str, args: [bytes], idem: bool, timeout_ms: int) -> Result<conn.Reply, errors.RError> {
+        client.exchange_bytes(self, cmd, args, idem, timeout_ms)
+    }
+
+    // SET with an arbitrary-binary value.
+    pub func set_bytes(self, key: str, val: bytes) -> Result<int, errors.RError> {
+        match resp.str_part(key) {
+            .ok(kb) => {
+                match self.do_with_bytes("SET", [kb, val], false, 0) {
+                    .ok(_) => .ok(0)
+                    .err(e) => .err(e)
+                }
+            }
+            .err(e) => .err(e)
+        }
+    }
+
+    // PUBLISH is non-idempotent: a dropped write is Ambiguous, never
+    // retried (a retry could double-deliver).
+    pub func publish(self, channel: str, payload: str) -> Result<int, errors.RError> {
+        match client.exchange(self, ["PUBLISH", channel, payload], false, 0) {
+            .ok(r) => int_of(r)
+            .err(e) => .err(e)
+        }
+    }
+
+    // GET with an arbitrary-binary result (miss is None).
+    pub func get_bytes(self, key: str) -> Result<Option<[int]>, errors.RError> {
+        match self.do("GET", [key]) {
+            .ok(r) => {
+                if resp.is_null(r.arena, conn.reply_value(r)) {
+                    .ok(.none)
+                } else {
+                    match resp.as_bytes(r.arena, conn.reply_value(r)) {
+                        .ok(b) => .ok(.some(b))
+                        .err(e) => .err(e)
+                    }
+                }
+            }
+            .err(e) => .err(e)
+        }
+    }
+}
+
+func collect_opts(a: resp.Arena, vs: [resp.Value]) -> Result<[Option<str>], errors.RError> {
+    out: [Option<str>] = []
+    for v in vs {
+        if resp.is_null(a, v) {
+            out = out.push(.none)
+        } else {
+            match resp.as_str(a, v) {
+                .ok(s) => {
+                    out = out.push(.some(s))
+                }
+                .err(e) => return .err(e)
+            }
+        }
+    }
+    .ok(out)
+}
+
+func str_of(r: conn.Reply) -> Result<str, errors.RError> {
+    resp.as_str(r.arena, conn.reply_value(r))
+}
+
+func int_of(r: conn.Reply) -> Result<int, errors.RError> {
+    resp.as_int(r.arena, conn.reply_value(r))
+}

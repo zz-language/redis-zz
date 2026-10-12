@@ -1,0 +1,14 @@
+import redis
+func main() -> Result<int, redis.RError> {
+    c := redis.connect("redis://127.0.0.1:6379")?
+    println("tcp: {c.ping()?}")
+    _ := c.close()
+    t := redis.connect("rediss://127.0.0.1:6380?tls_ca=/tmp/redis-tls/ca.pem")?
+    println("tls: {t.ping()?}")
+    _ := t.close()
+    u := redis.connect("redis+unix:///tmp/redis-unix/redis.sock")?
+    println("unix: {u.ping()?}")
+    _ := u.close()
+    println("transports_ok")
+    .ok(0)
+}

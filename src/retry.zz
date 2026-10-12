@@ -1,0 +1,118 @@
+// retry.zz — the §10.2 policy table as data + helpers.
+//
+// Two halves:
+// - Pure policy (testable with no server): idem_cmd delegates to
+//   client.idempotent (single source of truth; this alias exists so unit
+//   tests pin the table through one stable path), backoff_ms computes the
+//   exponential schedule min(1000, 20*2^attempt) with NO sleep — the
+//   caller (client.exchange, retryable) sleeps.
+// - Decorators as plain higher-order funcs (C-backend safe): retryable
+//   re-runs a thunk while it fails with kind "conflict"; timed reports
+//   one on_command event per call.
+//
+// Thunk pattern (concrete int payload): retryable is typed for the
+// transactional shape `func() -> Result<int, RError>` — the shape of a
+// WATCH...EXEC body returning an affected-row count. There is deliberately
+// one instantiation, not a generic over T: generic higher-order funcs are
+// risky on this toolchain. To retry other payloads, wrap the body so it
+// returns int (or stash the value in a cell and return 0):
+//
+//   attempt := || {
+//       match c.do("GET", [k]) {
+//           .ok(_) => 0
+//           .err(e) => .err(e)
+//       }
+//   }
+//   run := retry.retryable(attempt, 3)
+//   _u := run()
+//
+// Kwarg form `@retryable(tries=3)` lowers to retryable(f, tries=3): the
+// decorator receives the function value plus the named arg, exactly like
+// `@route("/hello")` receives (f, path).
+import std.time
+
+import redis.client as client
+import redis.errors as errors
+import redis.hooks as hooks
+
+// Test-facing alias for the §10.2 idempotency table. Single source:
+// client.idempotent owns the set, this delegates.
+
+pub func idem_cmd(cmd: str, nargs: int) -> bool {
+    client.idempotent(cmd, nargs)
+}
+
+// Pure backoff schedule: min(1000, 20*2^attempt) milliseconds.
+// attempt 0 -> 20, 1 -> 40, 2 -> 80, ... capped at 1000. No sleep here;
+// the caller sleeps (client.exchange sleeps inline, retryable below).
+
+pub func backoff_ms(attempt: int) -> int {
+    d := 20
+    i := 0
+    while i < attempt {
+        d = d * 2
+        if d > 1000 {
+            d = 1000
+        }
+        i = i + 1
+    }
+    d
+}
+
+// Decorator: re-run f while it fails with kind "conflict" (WATCH tripped),
+// up to `tries` total attempts. Any other error passes through immediately
+// (first failure, no sleep). Sleeps backoff_ms(n) between conflict
+// attempts. tries < 1 is clamped to 1 (exactly one attempt).
+
+pub func retryable(f: func() -> Result<int, errors.RError>, tries: int) -> func() -> Result<int, errors.RError> {
+    return || {
+        run_retry(f, tries)
+    }
+}
+
+func run_retry(f: func() -> Result<int, errors.RError>, tries: int) -> Result<int, errors.RError> {
+    limit := tries
+    if limit < 1 {
+        limit = 1
+    }
+    last:Option<errors.RError> = .none
+    n := 0
+    again := true
+    while again && n < limit {
+        match f() {
+            .ok(v) => return .ok(v)
+            .err(e) => {
+                last = .some(e)
+                again = e.kind == "conflict" && n + 1 < limit
+                if again {
+                    time.sleep_ms(backoff_ms(n))
+                }
+                n = n + 1
+            }
+        }
+    }
+    match last {
+        .some(e) => .err(e)
+        .none => .err(errors.conflict_error())
+    }
+}
+
+// Decorator: run f once, report wall-clock micros through
+// hook.on_command(name, micros, err_kind) with err_kind "" on success.
+// name is a command name (or "pipeline"/"txn" label), never a secret.
+
+pub func timed(name: str, f: func() -> Result<int, errors.RError>, hook: hooks.Hooks) -> Result<int, errors.RError> {
+    start := time.now_micros()
+    match f() {
+        .ok(v) => {
+            el := time.now_micros() - start
+            _u1 := hook.on_command(name, el, "")
+            .ok(v)
+        }
+        .err(e) => {
+            el2 := time.now_micros() - start
+            _u2 := hook.on_command(name, el2, e.kind)
+            .err(e)
+        }
+    }
+}

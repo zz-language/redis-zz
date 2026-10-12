@@ -1,0 +1,487 @@
+// chaos_test.zz — scripted failure deaths, no redis server (plan §14.2.5).
+//
+// Each case spawns tests/helpers/fsrv.zz as a CHILD PROCESS in a dedicated
+// mode (c4/c7/c8/c9/c10) and drives the real client single-threaded; counts
+// (frames, sessions) come back in the child's stdout report and are
+// asserted alongside the client-visible error kind. Single-exit throughout:
+// failures are counted, the child is always reaped, one final assert.
+//
+// Why processes: in-process task.spawn servers flaked ~50% per round-trip
+// on this toolchain (interpreter shell-pool race under concurrent net IO);
+// the child-process shape is deterministic. Covered: C4 auth rejection (no
+// retry, exactly 1 AUTH frame), C7 non-idempotent drop-after-send
+// (Ambiguous, exactly 1 frame), C8 idempotent drop-then-serve (success, 2
+// dials), C9 LOADING/READONLY/BUSY preserved as redis_error (1 frame
+// each), C10 mid-bulk stall (Timeout read, then redial works).
+//
+// Ports are pid/token-derived 32-wide lanes (ch_port); client timeouts are
+// generous (3s) except the C10 300ms stall leg, which the task mandates.
+import std.env
+import std.net
+import std.process
+import std.str
+import std.time
+
+import redis.client as client
+import redis.conn as conn
+import redis.errors as errors
+import redis.resp as resp
+import redis.url as url
+
+// ---- Child-process harness (mirrors fake_server_test.zz) ----
+
+func ch_zz() -> str {
+    "/home/zaid/.cargo/bin/zz"
+}
+
+func ch_srv() -> str {
+    cwd := env.cwd() ?? "."
+    "{cwd}/tests/helpers/fsrv.zz"
+}
+
+func ch_port(idx: int) -> int {
+    sweep_tok := env.get("ZZ_SWEEP_TOKEN") ?? "0"
+    tok_num := int(str.replace(sweep_tok, "t", "")) ?? 0
+    35000 + (process.pid() % 500) * 32 + tok_num % 32 + idx
+}
+
+func ch_spawn(args: [str]) -> Result<process, str> {
+    argv := ["run", ch_srv()]
+    for a in args {
+        argv = argv.push(a)
+    }
+    process.spawn(ch_zz(), argv)
+}
+
+func ch_poll(port: int, tries: int) -> int {
+    if tries <= 0 {
+        return 0 - 1
+    }
+    match net.tcp_connect("127.0.0.1:{port}", 300) {
+        .ok(raw) => ch_poll_hit(raw)
+        .err(_) => ch_poll_miss(port, tries)
+    }
+}
+
+func ch_poll_hit(raw: tcp.stream) -> int {
+    _u1 := raw.close()
+    0
+}
+
+func ch_poll_miss(port: int, tries: int) -> int {
+    time.sleep_ms(200)
+    ch_poll(port, tries - 1)
+}
+
+// No-retry dial: first error kind is the assertion target.
+
+func ch_dial0(port: int) -> Result<client.Client, errors.RError> {
+    match url.parse("redis://127.0.0.1:{port}?connect_timeout_ms=1000&timeout_ms=3000&retries=0") {
+        .ok(o) => client.connect_with(o)
+        .err(e) => .err(e)
+    }
+}
+
+// Default-retry dial (C8 needs the idempotent redial).
+
+func ch_dial_retry(port: int) -> Result<client.Client, errors.RError> {
+    match url.parse("redis://127.0.0.1:{port}?connect_timeout_ms=1000&timeout_ms=3000") {
+        .ok(o) => client.connect_with(o)
+        .err(e) => .err(e)
+    }
+}
+
+func ch_reap(ch: process) -> str {
+    match process.wait(ch) {
+        .ok(t) => ch_reap_ok(t)
+        .err(e) => "code=-1 out=WAITFAIL {e}"
+    }
+}
+
+func ch_reap_ok(t: [int | str | str]) -> str {
+    "code={t[0]} out={t[1]}"
+}
+
+func ch_check_report(rep: str, want: str, bad: int) -> int {
+    if str.contains(rep, want) == false {
+        println("FAIL report missing {want}: {rep}")
+        return bad + 1
+    }
+    bad
+}
+
+// ---- C4: AUTH rejection — auth kind, zero retries, exactly 1 AUTH frame ----
+
+@test
+func chaos_auth_rejected_no_retry() {
+    port := ch_port(1)
+    _u9 := match ch_spawn(["c4", "{port}"]) {
+        .ok(ch) => chaos_c4_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func chaos_c4_run(port: int, ch: process) -> int {
+    bad := 0
+    if ch_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match url.parse("redis://:zz-badpass@127.0.0.1:{port}?connect_timeout_ms=1000&timeout_ms=3000&retries=0") {
+        .ok(o) => {
+            bad = bad + chaos_c4_dial(o)
+        }
+        .err(e) => {
+            println("FAIL url {e.kind}")
+            bad = bad + 1
+        }
+    }
+    rep := ch_reap(ch)
+    bad = ch_check_report(rep, "code=0", bad)
+    bad = ch_check_report(rep, "frames=1", bad)
+    bad = ch_check_report(rep, "auth_hits=1", bad)
+    assert(bad == 0)
+    bad
+}
+
+func chaos_c4_dial(o: url.Options) -> int {
+    match client.connect_with(o) {
+        .ok(c) => {
+            println("FAIL want auth rejection")
+            _u1 := client.close(c)
+            1
+        }
+        .err(e) => chaos_c4_kind(e)
+    }
+}
+
+func chaos_c4_kind(e: errors.RError) -> int {
+    bad := 0
+    if e.kind != "auth" {
+        println("FAIL want auth got {e.kind} {e.detail}")
+        bad = bad + 1
+    }
+    bad
+}
+
+// ---- C7: INCR drop-after-send — Ambiguous, server saw exactly 1 frame ----
+
+@test
+func chaos_nonidempotent_drop_is_ambiguous() {
+    port := ch_port(2)
+    _u9 := match ch_spawn(["c7", "{port}"]) {
+        .ok(ch) => chaos_c7_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func chaos_c7_run(port: int, ch: process) -> int {
+    bad := 0
+    if ch_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match ch_dial0(port) {
+        .ok(c) => {
+            bad = bad + chaos_c7_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := ch_reap(ch)
+    bad = ch_check_report(rep, "code=0", bad)
+    bad = ch_check_report(rep, "cmd_frames=1", bad)
+    bad = ch_check_report(rep, "incr_hits=1", bad)
+    assert(bad == 0)
+    bad
+}
+
+func chaos_c7_check(c: client.Client) -> int {
+    match client.exchange(c, ["INCR", "k"], false, 0) {
+        .ok(_) => {
+            println("FAIL want ambiguous for dropped INCR")
+            _u1 := client.close(c)
+            1
+        }
+        .err(e) => chaos_c7_kind(c, e)
+    }
+}
+
+func chaos_c7_kind(c: client.Client, e: errors.RError) -> int {
+    bad := 0
+    if e.kind != "ambiguous" {
+        println("FAIL want ambiguous got {e.kind} {e.detail}")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+// ---- C8: GET drop-then-serve — success after redial, exactly 2 dials ----
+
+@test
+func chaos_idempotent_drop_retries() {
+    port := ch_port(3)
+    _u9 := match ch_spawn(["c8", "{port}"]) {
+        .ok(ch) => chaos_c8_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func chaos_c8_run(port: int, ch: process) -> int {
+    bad := 0
+    if ch_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match ch_dial_retry(port) {
+        .ok(c) => {
+            bad = bad + chaos_c8_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := ch_reap(ch)
+    bad = ch_check_report(rep, "code=0", bad)
+    bad = ch_check_report(rep, "sessions=2", bad)
+    bad = ch_check_report(rep, "get_hits=2", bad)
+    assert(bad == 0)
+    bad
+}
+
+func chaos_c8_check(c: client.Client) -> int {
+    match client.exchange(c, ["GET", "k"], true, 0) {
+        .ok(r) => chaos_c8_value(c, r)
+        .err(e) => {
+            println("FAIL want success after redial, got {e.kind} {e.detail}")
+            _u1 := client.close(c)
+            1
+        }
+    }
+}
+
+func chaos_c8_value(c: client.Client, r: conn.Reply) -> int {
+    match resp.as_str(r.arena, conn.reply_value(r)) {
+        .ok(s) => chaos_c8_str(c, s)
+        .err(e) => {
+            println("FAIL as_str {e.kind}")
+            _u1 := client.close(c)
+            1
+        }
+    }
+}
+
+func chaos_c8_str(c: client.Client, s: str) -> int {
+    bad := 0
+    if s != "foo" {
+        println("FAIL want foo got {s}")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+// ---- C9: -LOADING/-READONLY/-BUSY map to redis_error, 1 frame each ----
+
+@test
+func chaos_loading_is_redis_error() {
+    port := ch_port(4)
+    _u9 := match ch_spawn(["c9", "{port}", "LOADING", "loading dataset"]) {
+        .ok(ch) => chaos_c9_run(port, ch, "LOADING")
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+@test
+func chaos_readonly_is_redis_error() {
+    port := ch_port(5)
+    _u9 := match ch_spawn(["c9", "{port}", "READONLY", "you cannot write"]) {
+        .ok(ch) => chaos_c9_run(port, ch, "READONLY")
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+@test
+func chaos_busy_is_redis_error() {
+    port := ch_port(6)
+    _u9 := match ch_spawn(["c9", "{port}", "BUSY", "script busy"]) {
+        .ok(ch) => chaos_c9_run(port, ch, "BUSY")
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func chaos_c9_run(port: int, ch: process, code: str) -> int {
+    bad := 0
+    if ch_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match ch_dial0(port) {
+        .ok(c) => {
+            bad = bad + chaos_c9_check(c, code)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := ch_reap(ch)
+    bad = ch_check_report(rep, "code=0", bad)
+    bad = ch_check_report(rep, "cmd_frames=1", bad)
+    bad = ch_check_report(rep, "code={code}", bad)
+    assert(bad == 0)
+    bad
+}
+
+func chaos_c9_check(c: client.Client, code: str) -> int {
+    match client.exchange(c, ["GET", "k"], true, 0) {
+        .ok(_) => {
+            println("FAIL want redis error for -{code}")
+            _u1 := client.close(c)
+            1
+        }
+        .err(e) => chaos_c9_kind(c, e, code)
+    }
+}
+
+func chaos_c9_kind(c: client.Client, e: errors.RError, code: str) -> int {
+    bad := 0
+    if e.kind != "redis" {
+        println("FAIL want redis got {e.kind} {e.detail}")
+        bad = bad + 1
+    }
+    if str.contains(e.detail, code) == false {
+        println("FAIL detail missing {code}: {e.detail}")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}
+
+// ---- C10: mid-bulk stall — Timeout read, then redial works ----
+
+@test
+func chaos_midbulk_stall_then_redial() {
+    port := ch_port(7)
+    _u9 := match ch_spawn(["c10", "{port}"]) {
+        .ok(ch) => chaos_c10_run(port, ch)
+        .err(e) => {
+            println("FAIL spawn {e}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func chaos_c10_run(port: int, ch: process) -> int {
+    bad := 0
+    if ch_poll(port, 90) != 0 {
+        println("FAIL server never listened")
+        bad = bad + 1
+    }
+    match ch_dial0(port) {
+        .ok(c) => {
+            bad = bad + chaos_c10_check(c)
+        }
+        .err(e) => {
+            println("FAIL dial {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    rep := ch_reap(ch)
+    bad = ch_check_report(rep, "code=0", bad)
+    bad = ch_check_report(rep, "sessions=2", bad)
+    assert(bad == 0)
+    bad
+}
+
+func chaos_c10_check(c: client.Client) -> int {
+    match client.exchange(c, ["GET", "k"], true, 300) {
+        .ok(_) => {
+            println("FAIL want timeout for stalled bulk")
+            _u1 := client.close(c)
+            1
+        }
+        .err(e) => chaos_c10_kind(c, e)
+    }
+}
+
+func chaos_c10_kind(c: client.Client, e: errors.RError) -> int {
+    bad := 0
+    if e.kind != "timeout" {
+        println("FAIL want timeout got {e.kind} {e.detail}")
+        bad = bad + 1
+    }
+    bad + chaos_c10_redial(c)
+}
+
+func chaos_c10_redial(c: client.Client) -> int {
+    match client.redial(c) {
+        .ok(_) => chaos_c10_again(c)
+        .err(e) => {
+            println("FAIL redial {e.kind} {e.detail}")
+            _u1 := client.close(c)
+            1
+        }
+    }
+}
+
+func chaos_c10_again(c: client.Client) -> int {
+    match client.exchange(c, ["GET", "k"], true, 0) {
+        .ok(r) => chaos_c10_value(c, r)
+        .err(e) => {
+            println("FAIL want success after redial, got {e.kind} {e.detail}")
+            _u1 := client.close(c)
+            1
+        }
+    }
+}
+
+func chaos_c10_value(c: client.Client, r: conn.Reply) -> int {
+    match resp.as_str(r.arena, conn.reply_value(r)) {
+        .ok(s) => chaos_c10_str(c, s)
+        .err(e) => {
+            println("FAIL as_str {e.kind}")
+            _u1 := client.close(c)
+            1
+        }
+    }
+}
+
+func chaos_c10_str(c: client.Client, s: str) -> int {
+    bad := 0
+    if s != "OK" {
+        println("FAIL want OK got {s}")
+        bad = bad + 1
+    }
+    _u1 := client.close(c)
+    bad
+}

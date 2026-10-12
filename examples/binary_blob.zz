@@ -1,0 +1,34 @@
+import redis
+// 1MB arbitrary-binary round trip (plan T2.7 shape): every byte value
+// 0-255, including invalid UTF-8 and NUL/CRLF framing bytes.
+func main() -> Result<int, redis.RError> {
+    c := redis.connect("redis://127.0.0.1:6379")?
+    data: [int] = []
+    i := 0
+    while i < 1048576 {
+        data = data.push((i * 1103515245 + 12345) % 256)
+        i = i + 1
+    }
+    match bytes.finish(data) {
+        .ok(blob) => {
+            _ := c.set_bytes("zz:blob", blob)?
+            match c.get_bytes("zz:blob") {
+                .ok(v) => {
+                    match v {
+                        .some(back) => {
+                            println("blob_len: {back.len()}")
+                            println("blob_eq: {back == data}")
+                            _ := c.del(["zz:blob"])?
+                            println("blob_ok")
+                        }
+                        .none => println("blob MISS")
+                    }
+                }
+                .err(e) => println("get err: {redis.message(e)}")
+            }
+        }
+        .err(e) => println("finish err: {e}")
+    }
+    _ := c.close()
+    .ok(0)
+}

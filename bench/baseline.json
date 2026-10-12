@@ -1,0 +1,1 @@
+{"box":"local-docker","engine":"vm","results":{"get1k":{"ms":1245,"ops":100,"ops_per_s":80},"ping":{"ms":461,"ops":200,"ops_per_s":433},"pipe100":{"ms":6871,"ops":50,"ops_per_s":7}}}

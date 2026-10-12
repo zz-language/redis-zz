@@ -1,0 +1,67 @@
+import std.time
+
+import redis
+
+func cmds100() -> [[str]] {
+    out:[[str]] = []
+    i := 0
+    while i < 100 {
+        out = out.push(["PING"])
+        i = i + 1
+    }
+    out
+}
+
+func run_once(c: redis.Client, cmds: [[str]], n: int) -> Result<int, redis.RError> {
+    t0 := time.now_ms()
+    i := 0
+    while i < n {
+        _u9 := redis.pipe(c, cmds)?
+        i = i + 1
+    }
+    t1 := time.now_ms()
+    .ok(t1 - t0)
+}
+
+func insert_sorted(srt: [int], x: int) -> [int] {
+    out:[int] = []
+    done := false
+    for v in srt {
+        if done == false && x < v {
+            out = out.push(x)
+            done = true
+        }
+        out = out.push(v)
+    }
+    if done == false {
+        out = out.push(x)
+    }
+    out
+}
+
+func median5(a: int, b: int, c: int, d: int, e: int) -> int {
+    s1 := insert_sorted([], a)
+    s2 := insert_sorted(s1, b)
+    s3 := insert_sorted(s2, c)
+    s4 := insert_sorted(s3, d)
+    s5 := insert_sorted(s4, e)
+    s5[2]
+}
+
+func main() -> Result<int, redis.RError> {
+    c := redis.connect("redis://127.0.0.1:6379")?
+    cmds := cmds100()
+    r0 := run_once(c, cmds, 50)?
+    r1 := run_once(c, cmds, 50)?
+    r2 := run_once(c, cmds, 50)?
+    r3 := run_once(c, cmds, 50)?
+    r4 := run_once(c, cmds, 50)?
+    m := median5(r0, r1, r2, r3, r4)
+    ops := 0
+    if m > 0 {
+        ops = 50 * 1000 / m
+    }
+    println("pipe100 ops=50 ms={m} ops_per_s={ops}")
+    _u1 := c.close()
+    .ok(0)
+}

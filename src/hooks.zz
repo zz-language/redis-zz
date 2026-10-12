@@ -1,0 +1,45 @@
+// hooks.zz — metrics hook interface (plan v3 §12).
+//
+// A Hooks value carries five callbacks. Zero dependency: the client never
+// imports a logger; user code plugs one in by constructing a Hooks value
+// (see no_hooks for the silent default, and retry.timed for the one
+// in-tree consumer).
+//
+// Conventions (stable):
+// - on_command(cmd, micros, err_kind): cmd is the command NAME only
+//   ("GET", "pipeline", "EXEC", ...), never keys, values, or passwords.
+//   micros is wall-clock time for the call. err_kind is "" on success,
+//   else the RError kind ("timeout", "conflict", ...).
+// - on_retry(cmd, attempt): one event per idempotent retry inside
+//   client.exchange (plus conflict retries in retry.retryable).
+// - on_reconnect(addr): after a redial replaces the live connection
+//   ("host:port" or socket path, never a secret).
+// - on_ambiguous(cmd): bytes were sent but no usable reply arrived —
+//   the outcome is unknown, the caller must verify before resending.
+// - on_insecure(detail): loud opt-ins only — tls_insecure connects and
+//   plaintext+password to non-loopback (detail names the reason).
+//
+// Every slot returns int (0 = ok) so hooks compose in statement position.
+// Hooks are NOT stored in Client in v0.2 (that would change every Client
+// signature); they are passed explicitly to helpers like retry.timed.
+
+// All func-typed fields, all required (no defaults): a Hooks value is
+// always complete. Callers pass command names only — never secrets.
+pub struct Hooks {
+    on_command: func(str, int, str) -> int,
+    on_retry: func(str, int) -> int,
+    on_reconnect: func(str) -> int,
+    on_ambiguous: func(str) -> int,
+    on_insecure: func(str) -> int,
+}
+
+// Silent default: every slot a no-op returning 0.
+//
+// Note: the slots are closure literals built here in the body. Bare
+// top-level func names do NOT coerce to func values on this toolchain,
+// so the "tiny top-level no-op funcs" shape from the plan is spelled as
+// literals instead — same semantics, one construction site.
+
+pub func no_hooks() -> Hooks {
+    Hooks{on_command: |_cmd: str, _micros: int, _err: str| 0, on_retry: |_cmd: str, _attempt: int| 0, on_reconnect: |_addr: str| 0, on_ambiguous: |_cmd: str| 0, on_insecure: |_detail: str| 0}
+}

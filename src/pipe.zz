@@ -1,0 +1,197 @@
+// pipe.zz — pipeline + MULTI/EXEC/WATCH over any Client (plan v3 §10.2).
+//
+// Pipelines send N commands in ONE write and read N replies in order
+// (one round trip). MULTI/EXEC/WATCH add optimistic transactions on top.
+// Neither ever retries after the first byte: partial failure is reported
+// with sent/received counts (protocol_error "pipeline_partial sent=N
+// received=K"), never hidden, never re-sent.
+//
+// Per-command server errors (-WRONGTYPE, -ERR, ...) inside a pipeline or
+// EXEC array are R_ERROR reply VALUES in order — not call errors. The
+// caller inspects each reply (resp.tag_of == R_ERROR, then
+// conn.reply_error for the taxonomy). Only transport/parse failures, a
+// refused queue slot, or a nil EXEC (WATCH tripped -> conflict_error)
+// fail the whole call.
+//
+// WATCH pins the connection: from the first WATCH until EXEC/DISCARD/
+// UNWATCH the slot carries transaction state. Pooled callers must
+// pool.pinned + pool.conn_at (exclusive slot), run watch/multi here on
+// that slot Client, then checkin. Sharing a watched slot corrupts every
+// borrower — the pool cannot detect it, so the discipline is documented,
+// not enforced.
+//
+// Out of scope (plan deviation log):
+// - Closure-sugar `pipe(|p| ...)` / `multi(|t| ...)`: a struct builder
+//   cannot accumulate commands — structs/arrays are VALUES, so each
+//   `p.set(...)` would append to a copy and the queue would stay empty.
+//   Commands are [[str]] argv lists instead (simpler, honest, C-safe).
+// - client.raw_pipe returns [conn.Reply], not PipeOut: PipeOut lives
+//   here and client.zz must not import pipe.zz (cycle). pipe() wraps the
+//   array with sent/received counts.
+import std.bytes
+
+import redis.client as client
+import redis.conn as conn
+import redis.errors as errors
+import redis.resp as resp
+
+// Ordered replies for one pipeline: replies.len() == sent on success.
+// On partial failure there is no PipeOut — the error detail carries
+// "pipeline_partial sent=N received=K" (see header: no silent halves).
+
+pub struct PipeOut {
+    replies: [conn.Reply],
+    sent: int,
+    received: int,
+}
+
+// One round trip: encode every argv, ONE write, N reads in order.
+// Empty cmds short-circuits to an empty PipeOut (no bytes sent).
+
+pub func pipe(c: client.Client, cmds: [[str]]) -> Result<PipeOut, errors.RError> {
+    if cmds.len() == 0 {
+        return .ok(PipeOut{replies: [], sent: 0, received: 0})
+    }
+    frames:[bytes] = []
+    for cmd in cmds {
+        frames = frames.push(resp.encode(cmd))
+    }
+    match concat(frames) {
+        .ok(frame) => {
+            match client.raw_pipe(c, frame, cmds.len()) {
+                .ok(rs) => .ok(PipeOut{replies: rs, sent: cmds.len(), received: rs.len()})
+                .err(e) => .err(e)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+func concat(frames: [bytes]) -> Result<bytes, errors.RError> {
+    out:[int] = []
+    for fr in frames {
+        out = extend(out, bytes.to_ints(fr))
+    }
+    match bytes.finish(out) {
+        .ok(b) => .ok(b)
+        .err(_) => .err(errors.protocol_error("pipeline_frame_too_large"))
+    }
+}
+
+func extend(xs: [int], ys: [int]) -> [int] {
+    out := xs
+    for y in ys {
+        out = out.push(y)
+    }
+    out
+}
+
+// Transaction: MULTI, queue every cmd (each must answer +QUEUED — any
+// other reply aborts via DISCARD + redis_error EXECABORT), EXEC, return
+// the result array in order. EXEC nil means WATCH tripped ->
+// conflict_error (re-run the whole body via retry.retryable). Every step
+// runs idem=false: never retried, IO failure after bytes is reported
+// (exchange maps it to Ambiguous) and the slot is resynced by redial so
+// no half-transaction state leaks to the next caller.
+
+pub func multi(c: client.Client, cmds: [[str]]) -> Result<[conn.Reply], errors.RError> {
+    match client.exchange(c, ["MULTI"], false, 0) {
+        .ok(_) => multi_queue(c, cmds)
+        .err(e) => .err(e)
+    }
+}
+
+func multi_queue(c: client.Client, cmds: [[str]]) -> Result<[conn.Reply], errors.RError> {
+    i := 0
+    while i < cmds.len() {
+        match client.exchange(c, cmds[i], false, 0) {
+            .ok(r) => {
+                match resp.as_str(r.arena, conn.reply_value(r)) {
+                    .ok(s) => {
+                        if s != "QUEUED" {
+                            return multi_abort(c, errors.redis_error("EXECABORT", "expected +QUEUED, got +{s}"))
+                        }
+                    }
+                    .err(_) => {
+                        return multi_abort(c, errors.protocol_error("multi_expected_queued"))
+                    }
+                }
+            }
+            .err(e) => {
+                return multi_abort(c, e)
+            }
+        }
+        i = i + 1
+    }
+    multi_exec(c)
+}
+
+func multi_abort(c: client.Client, cause: errors.RError) -> Result<[conn.Reply], errors.RError> {
+    _u1 := discard_best(c)
+    _u2 := resync_best(c)
+    .err(cause)
+}
+
+func multi_exec(c: client.Client) -> Result<[conn.Reply], errors.RError> {
+    match client.exchange(c, ["EXEC"], false, 0) {
+        .ok(r) => {
+            if resp.is_null(r.arena, conn.reply_value(r)) {
+                return .err(errors.conflict_error())
+            }
+            match resp.as_array(r.arena, conn.reply_value(r)) {
+                .ok(vs) => .ok(kids_as_replies(r.arena, vs))
+                .err(e) => .err(e)
+            }
+        }
+        .err(e) => {
+            _u3 := resync_best(c)
+            .err(e)
+        }
+    }
+}
+
+func kids_as_replies(a: resp.Arena, vs: [resp.Value]) -> [conn.Reply] {
+    out:[conn.Reply] = []
+    for v in vs {
+        out = out.push(conn.Reply{arena: a, id: v.id})
+    }
+    out
+}
+
+func discard_best(c: client.Client) -> int {
+    match client.exchange(c, ["DISCARD"], false, 0) {
+        .ok(_) => 0
+        .err(_) => 0
+    }
+}
+
+func resync_best(c: client.Client) -> int {
+    match client.redial(c) {
+        .ok(_) => 0
+        .err(_) => 0
+    }
+}
+
+// Guard keys for the next multi on this connection (answers +OK).
+// Pins the slot until EXEC/DISCARD/unwatch — see header.
+
+pub func watch(c: client.Client, keys: [str]) -> Result<int, errors.RError> {
+    args := ["WATCH"]
+    for k in keys {
+        args = args.push(k)
+    }
+    match client.exchange(c, args, false, 0) {
+        .ok(_) => .ok(0)
+        .err(e) => .err(e)
+    }
+}
+
+// Release all watched keys (+OK). Also call it (or DISCARD) to unpin a
+// slot after abandoning a transaction without EXEC.
+
+pub func unwatch(c: client.Client) -> Result<int, errors.RError> {
+    match client.exchange(c, ["UNWATCH"], false, 0) {
+        .ok(_) => .ok(0)
+        .err(e) => .err(e)
+    }
+}

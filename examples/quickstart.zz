@@ -1,0 +1,27 @@
+import redis
+func main() -> Result<int, redis.RError> {
+    c := redis.connect("redis://127.0.0.1:6379")?
+    p := c.ping()?
+    println("ping: {p}")
+    _ := c.set("zz:smoke", "hello", 0)?
+    match c.get("zz:smoke") {
+        .ok(v) => {
+            match v {
+                .some(s) => println("get: {s}")
+                .none => println("get: MISS")
+            }
+        }
+        .err(e) => println("get err: {redis.message(e)}")
+    }
+    n := c.incr("zz:count")?
+    println("incr: {n}")
+    m := c.mget(["zz:smoke", "zz:nope"])?
+    println("mget_len: {m.len()}")
+    t := c.ttl("zz:smoke")?
+    println("ttl: {t}")
+    d := c.del(["zz:smoke", "zz:count"])?
+    println("del: {d}")
+    _ := c.close()
+    println("smoke_ok")
+    .ok(0)
+}

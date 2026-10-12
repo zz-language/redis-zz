@@ -1,0 +1,763 @@
+// live_test.zz — env-gated TCP subset against a real server (plan §14.2.6).
+//
+// Every test dials REDIS_URL (default redis://127.0.0.1:6379) with a fast
+// connect gate (500ms): conn_refused SKIP-passes (println + return) so the
+// file is green with and without servers. Anything past connect is
+// asserted strictly. Keys are unique per process (zz:{pid}:...) and every
+// mutating test dels its keys (never FLUSHALL). Single-threaded
+// throughout. Discipline: every match is a statement with unit arms;
+// failures mutate the outer `bad` counter, closed by one final assert.
+import std.bytes
+import std.env
+import std.process
+import std.str
+
+import redis.client as client
+import redis.cmds as cmds
+import redis.errors as errors
+import redis.url as url
+
+// ---- Gated harness ----
+
+func live_url_raw() -> str {
+    env.get("REDIS_URL") ?? "redis://127.0.0.1:6379"
+}
+
+func live_dial() -> Result<client.Client, errors.RError> {
+    match url.parse(live_url_raw()) {
+        .ok(o) => live_dial_opts(o)
+        .err(e) => .err(e)
+    }
+}
+
+func live_dial_opts(o: url.Options) -> Result<client.Client, errors.RError> {
+    o.connect_ms = 500
+    o.read_ms = 5000
+    o.write_ms = 5000
+    client.connect_with(o)
+}
+
+func live_skip(what: str) -> int {
+    println("SKIP {what}: no live server at {live_url_raw()}")
+    0
+}
+
+func live_skip_kind(what: str, e: errors.RError) -> int {
+    if e.kind == "conn_refused" {
+        return live_skip(what)
+    }
+    println("FAIL {what} dial {e.kind} {e.detail}")
+    assert(false)
+    0
+}
+
+func live_key(tid: str, name: str) -> str {
+    "zz:{process.pid()}:{tid}:{name}"
+}
+
+func live_must_bytes(xs: [int]) -> bytes {
+    match bytes.finish(xs) {
+        .ok(b) => b
+        .err(_) => live_must_bytes([0])
+    }
+}
+
+func live_dbl(xs: [int]) -> [int] {
+    out := xs
+    for x in xs {
+        out = out.push(x)
+    }
+    out
+}
+
+// Deterministic 1MiB blob: 4KiB base doubled 8 times (no O(n^2) pushes).
+
+func live_blob_1m() -> bytes {
+    chunk:[int] = []
+    i := 0
+    while i < 4096 {
+        chunk = chunk.push(i % 251)
+        i = i + 1
+    }
+    c := chunk
+    j := 0
+    while j < 8 {
+        c = live_dbl(c)
+        j = j + 1
+    }
+    live_must_bytes(c)
+}
+
+func live_noop_ok(bad: int) -> int {
+    bad
+}
+
+// ---- Cases ----
+
+@test
+func live_ping() {
+    _u9 := match live_dial() {
+        .ok(c) => live_ping_body(c)
+        .err(e) => live_skip_kind("ping", e)
+    }
+}
+
+func live_ping_body(c: client.Client) -> int {
+    bad := 0
+    match c.ping() {
+        .ok(p) => {
+            if p != "PONG" {
+                println("FAIL want PONG got {p}")
+                bad = bad + 1
+            }
+        }
+        .err(e) => {
+            println("FAIL ping {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+@test
+func live_set_get_del() {
+    _u9 := match live_dial() {
+        .ok(c) => live_sgd_body(c)
+        .err(e) => live_skip_kind("set_get_del", e)
+    }
+}
+
+func live_sgd_body(c: client.Client) -> int {
+    bad := 0
+    k := live_key("sgd", "k")
+    match c.set(k, "v1", 0) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL set {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.get(k) {
+        .ok(v) => {
+            bad = bad + live_sgd_got(v, "v1")
+        }
+        .err(e) => {
+            println("FAIL get {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.del([k]) {
+        .ok(n) => {
+            if n != 1 {
+                println("FAIL del want 1 got {n}")
+                bad = bad + 1
+            }
+        }
+        .err(e) => {
+            println("FAIL del {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.get(k) {
+        .ok(v) => {
+            match v {
+                .some(s) => {
+                    println("FAIL want miss got {s}")
+                    bad = bad + 1
+                }
+                .none => {
+                    bad = live_noop_ok(bad)
+                }
+            }
+        }
+        .err(e) => {
+            println("FAIL get2 {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+func live_sgd_got(v: Option<str>, want: str) -> int {
+    match v {
+        .some(s) => live_sgd_eq(s, want)
+        .none => {
+            println("FAIL want {want} got miss")
+            1
+        }
+    }
+}
+
+func live_sgd_eq(s: str, want: str) -> int {
+    if s != want {
+        println("FAIL want {want} got {s}")
+        return 1
+    }
+    0
+}
+
+@test
+func live_binary_key_roundtrip() {
+    _u9 := match live_dial() {
+        .ok(c) => live_binkey_body(c)
+        .err(e) => live_skip_kind("binary_key", e)
+    }
+}
+
+// Keys containing CR LF NUL round-trip exactly (binary-safe framing).
+
+func live_binkey_body(c: client.Client) -> int {
+    bad := 0
+    k := "zz:{process.pid()}:binkey:\r\n\x00:K"
+    match c.set(k, "binval", 0) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL set {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.get(k) {
+        .ok(v) => {
+            bad = bad + live_sgd_got(v, "binval")
+        }
+        .err(e) => {
+            println("FAIL get {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.del([k]) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL del {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+@test
+func live_blob_1m_roundtrip() {
+    _u9 := match live_dial() {
+        .ok(c) => live_blob_body(c)
+        .err(e) => live_skip_kind("blob_1m", e)
+    }
+}
+
+func live_blob_body(c: client.Client) -> int {
+    bad := 0
+    k := live_key("blob", "big")
+    blob := live_blob_1m()
+    want := bytes.to_ints(blob)
+    if want.len() != 1048576 {
+        println("FAIL blob build len {want.len()}")
+        bad = bad + 1
+    }
+    match c.set_bytes(k, blob) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL set_bytes {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.get_bytes(k) {
+        .ok(v) => {
+            bad = bad + live_blob_got(v, want)
+        }
+        .err(e) => {
+            println("FAIL get_bytes {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.del([k]) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL del {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+func live_blob_got(v: Option<[int]>, want: [int]) -> int {
+    match v {
+        .some(got) => live_blob_eq(got, want)
+        .none => {
+            println("FAIL want blob got miss")
+            1
+        }
+    }
+}
+
+func live_blob_eq(got: [int], want: [int]) -> int {
+    if got.len() != want.len() {
+        println("FAIL blob len {got.len()} want {want.len()}")
+        return 1
+    }
+    if got == want {
+        return 0
+    }
+    println("FAIL blob bytes differ")
+    1
+}
+
+@test
+func live_expire_ttl() {
+    _u9 := match live_dial() {
+        .ok(c) => live_exp_body(c)
+        .err(e) => live_skip_kind("expire_ttl", e)
+    }
+}
+
+func live_exp_body(c: client.Client) -> int {
+    bad := 0
+    k := live_key("exp", "k")
+    match c.set(k, "x", 0) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL set {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.expire(k, 100) {
+        .ok(n) => {
+            if n != 1 {
+                println("FAIL expire want 1 got {n}")
+                bad = bad + 1
+            }
+        }
+        .err(e) => {
+            println("FAIL expire {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.ttl(k) {
+        .ok(t) => {
+            if t <= 0 || t > 100 {
+                println("FAIL ttl want 1..100 got {t}")
+                bad = bad + 1
+            }
+        }
+        .err(e) => {
+            println("FAIL ttl {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.del([k]) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL del {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+@test
+func live_incr_sequence() {
+    _u9 := match live_dial() {
+        .ok(c) => live_incr_body(c)
+        .err(e) => live_skip_kind("incr", e)
+    }
+}
+
+func live_incr_body(c: client.Client) -> int {
+    bad := 0
+    k := live_key("incr", "ctr")
+    match c.del([k]) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL del {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.incr(k) {
+        .ok(n) => {
+            if n != 1 {
+                println("FAIL incr1 want 1 got {n}")
+                bad = bad + 1
+            }
+        }
+        .err(e) => {
+            println("FAIL incr {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.incr(k) {
+        .ok(n) => {
+            if n != 2 {
+                println("FAIL incr2 want 2 got {n}")
+                bad = bad + 1
+            }
+        }
+        .err(e) => {
+            println("FAIL incr {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.del([k]) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL del {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+@test
+func live_mget_with_miss() {
+    _u9 := match live_dial() {
+        .ok(c) => live_mget_body(c)
+        .err(e) => live_skip_kind("mget", e)
+    }
+}
+
+func live_mget_body(c: client.Client) -> int {
+    bad := 0
+    ka := live_key("mget", "a")
+    km := live_key("mget", "missing")
+    match c.set(ka, "va", 0) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL set {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.mget([ka, km]) {
+        .ok(vs) => {
+            bad = bad + live_mget_check(vs, "va")
+        }
+        .err(e) => {
+            println("FAIL mget {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.del([ka]) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL del {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+func live_mget_check(vs: [Option<str>], want: str) -> int {
+    bad := 0
+    if vs.len() != 2 {
+        println("FAIL mget len {vs.len()}")
+        return bad + 1
+    }
+    match vs[0] {
+        .some(s) => {
+            if s != want {
+                println("FAIL mget[0] want {want} got {s}")
+                bad = bad + 1
+            }
+        }
+        .none => {
+            println("FAIL mget[0] want hit")
+            bad = bad + 1
+        }
+    }
+    match vs[1] {
+        .some(s) => {
+            println("FAIL mget[1] want miss got {s}")
+            bad = bad + 1
+        }
+        .none => {
+            bad = live_noop_ok(bad)
+        }
+    }
+    bad
+}
+
+@test
+func live_wrong_password_is_auth() {
+    _u9 := match url.parse(live_url_raw()) {
+        .ok(o) => live_badpass_run(o)
+        .err(e) => {
+            println("FAIL url {e.kind}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func live_badpass_run(o: url.Options) -> int {
+    o.pass = "zz-wrong-pass"
+    o.connect_ms = 500
+    match client.connect_with(o) {
+        .ok(c) => {
+            println("FAIL want auth rejection")
+            _u1 := client.close(c)
+            assert(false)
+            1
+        }
+        .err(e) => live_badpass_kind(e)
+    }
+}
+
+func live_badpass_kind(e: errors.RError) -> int {
+    if e.kind == "conn_refused" {
+        println("SKIP wrong_password: no live server")
+        return 0
+    }
+    if e.kind != "auth" {
+        println("FAIL want auth got {e.kind} {e.detail}")
+        assert(false)
+        return 1
+    }
+    0
+}
+
+@test
+func live_nosuchcmd_is_redis_error() {
+    _u9 := match live_dial() {
+        .ok(c) => live_nosuch_body(c)
+        .err(e) => live_skip_kind("nosuchcmd", e)
+    }
+}
+
+func live_nosuch_body(c: client.Client) -> int {
+    bad := 0
+    match c.do("NOSUCHCMD", []) {
+        .ok(_) => {
+            println("FAIL want error for NOSUCHCMD")
+            bad = bad + 1
+        }
+        .err(e) => {
+            bad = bad + live_kind_is(e, "redis", "NOSUCHCMD")
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+func live_kind_is(e: errors.RError, want: str, what: str) -> int {
+    if e.kind != want {
+        println("FAIL {what} want {want} got {e.kind} {e.detail}")
+        return 1
+    }
+    0
+}
+
+@test
+func live_wrongtype_is_redis_error() {
+    _u9 := match live_dial() {
+        .ok(c) => live_wrongtype_body(c)
+        .err(e) => live_skip_kind("wrongtype", e)
+    }
+}
+
+func live_wrongtype_body(c: client.Client) -> int {
+    bad := 0
+    k := live_key("wt", "list")
+    match c.del([k]) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL del {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.do("LPUSH", [k, "a"]) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL lpush {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match c.get(k) {
+        .ok(_) => {
+            println("FAIL want WRONGTYPE for GET on list")
+            bad = bad + 1
+        }
+        .err(e) => {
+            bad = bad + live_kind_is(e, "redis", "wrongtype")
+            if str.contains(e.detail, "WRONGTYPE") == false {
+                println("FAIL detail {e.detail}")
+                bad = bad + 1
+            }
+        }
+    }
+    match c.del([k]) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL del {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := c.close()
+    assert(bad == 0)
+    bad
+}
+
+@test
+func live_db_isolation() {
+    _u9 := match url.parse(live_url_raw()) {
+        .ok(o) => live_db_run(o)
+        .err(e) => {
+            println("FAIL url {e.kind}")
+            assert(false)
+            0
+        }
+    }
+}
+
+// A key written in db B is invisible in db A (and vice versa).
+
+func live_db_run(o: url.Options) -> int {
+    bad := 0
+    b := o.db + 1
+    if b > 15 {
+        b = 0
+    }
+    ob := o
+    ob.db = b
+    ob.connect_ms = 500
+    ob.read_ms = 5000
+    ob.write_ms = 5000
+    oa := o
+    oa.connect_ms = 500
+    oa.read_ms = 5000
+    oa.write_ms = 5000
+    match client.connect_with(ob) {
+        .ok(cb) => {
+            match client.connect_with(oa) {
+                .ok(ca) => {
+                    bad = bad + live_db_check(ca, cb, b)
+                }
+                .err(e) => {
+                    _u2 := client.close(cb)
+                    bad = bad + live_skip_or_fail("db_isolation A", e)
+                }
+            }
+        }
+        .err(e) => {
+            bad = bad + live_skip_or_fail("db_isolation B", e)
+        }
+    }
+    assert(bad == 0)
+    bad
+}
+
+func live_skip_or_fail(what: str, e: errors.RError) -> int {
+    if e.kind == "conn_refused" {
+        println("SKIP {what}: no live server")
+        return 0
+    }
+    println("FAIL {what} dial {e.kind} {e.detail}")
+    1
+}
+
+func live_db_check(ca: client.Client, cb: client.Client, b: int) -> int {
+    bad := 0
+    k := live_key("dbiso", "k")
+    match cb.set(k, "in-b", 0) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL set B {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match ca.get(k) {
+        .ok(v) => {
+            match v {
+                .some(s) => {
+                    println("FAIL db leak: A saw {s} (B={b})")
+                    bad = bad + 1
+                }
+                .none => {
+                    bad = live_noop_ok(bad)
+                }
+            }
+        }
+        .err(e) => {
+            println("FAIL get A {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match cb.get(k) {
+        .ok(v) => {
+            bad = bad + live_sgd_got(v, "in-b")
+        }
+        .err(e) => {
+            println("FAIL get B {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    match cb.del([k]) {
+        .ok(_) => {
+            bad = live_noop_ok(bad)
+        }
+        .err(e) => {
+            println("FAIL del B {e.kind} {e.detail}")
+            bad = bad + 1
+        }
+    }
+    _u1 := ca.close()
+    _u2 := cb.close()
+    bad
+}
+
+@test
+func live_redacted_hides_password() {
+    assert(cmds.version() != "")
+    match url.parse("redis://alice:s3cret-pw@127.0.0.1:6379/0") {
+        .ok(o) => {
+            r := url.redacted(o)
+            assert(str.contains(r, "***"))
+            assert(str.contains(r, "s3cret-pw") == false)
+            assert(str.contains(r, "alice"))
+        }
+        .err(e) => {
+            println("FAIL url {e.kind}")
+            assert(false)
+        }
+    }
+}

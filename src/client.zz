@@ -1,0 +1,338 @@
+// client.zz — one client over a single connection (plan v3 §6, §10.2).
+//
+// v0.1 ships a single-connection Client behind the final API; the fixed
+// pool (v0.2) slots behind the same methods. Client is a cheap handle:
+// connections never escape (a later async executor is not a breaking
+// change). Every public fn returns Result; a cache miss is a value
+// (None), never an error.
+//
+// Retry policy (§10.2): a command retries automatically only if the
+// failure happened before any byte was sent (dial/connect failure), or
+// the command is idempotent and the error is IO/timeout/closed. Anything
+// else after bytes went out is Ambiguous(cmd) — the caller decides, we
+// never guess. Pipelines and MULTI/EXEC never retry after the first
+// byte. Redis/Auth/Tls/Protocol/Url errors never retry.
+// Backoff is exponential (20ms base, 1s cap, `retries` attempts).
+import std.cell
+import std.time
+
+import redis.conn as conn
+import redis.errors as errors
+import redis.resp as resp
+import redis.transport as transport
+import redis.url as url
+
+pub struct Client {
+    slot: cell,
+    opts: url.Options,
+    retries: int,
+}
+
+// Dial and wrap. The live Conn lives in a cell so reconnects replace it
+// for all later calls without ever exposing it.
+
+pub func connect(raw: str) -> Result<Client, errors.RError> {
+    match url.parse(raw) {
+        .ok(o) => connect_with(o)
+        .err(e) => .err(e)
+    }
+}
+
+pub func connect_with(o: url.Options) -> Result<Client, errors.RError> {
+    match conn.dial(o) {
+        .ok(c) => .ok(Client{slot: cell.new(c), opts: o, retries: o.retries})
+        .err(e) => .err(e)
+    }
+}
+
+pub func close(cli: Client) -> int {
+    match cell.get(cli.slot) {
+        .ok(c) => {
+            _ := cell.drop(cli.slot)
+            transport.close(c.t)
+        }
+        .err(_) => 0
+    }
+}
+
+func live(cli: Client) -> Result<conn.Conn, errors.RError> {
+    match cell.get(cli.slot) {
+        .ok(c) => {
+            cc:conn.Conn = c
+            .ok(cc)
+        }
+        .err(_) => .err(errors.closed_error("command"))
+    }
+}
+
+// Replace the live connection (broken peer) with a fresh dial. Public
+// for pool rotation; single clients use it internally on retry.
+
+pub func redial(cli: Client) -> Result<conn.Conn, errors.RError> {
+    match conn.dial(cli.opts) {
+        .ok(nc) => {
+            match cell.set(cli.slot, nc) {
+                .ok(_) => .ok(nc)
+                .err(_) => .err(errors.closed_error("command"))
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+func backoff(attempt: int) -> int {
+    d := 20
+    i := 0
+    while i < attempt {
+        d = d * 2
+        if d > 1000 {
+            d = 1000
+        }
+        i = i + 1
+    }
+    time.sleep_ms(d)
+    0
+}
+
+// Idempotent set (§10.2): read-only commands plus idempotent writes.
+// SET counts only in plain `SET k v` form; option-bearing SET (NX/XX/GET/
+// EX/...) is non-idempotent (safe direction). Unknown commands are NOT
+// idempotent unless the caller passes idempotent=true explicitly.
+
+pub func idempotent(cmd: str, nargs: int) -> bool {
+    c := upper(cmd)
+    if c == "GET" || c == "MGET" || c == "EXISTS" || c == "TTL" || c == "PTTL" || c == "TYPE" || c == "STRLEN" {
+        return true
+    }
+    if c == "HGET" || c == "HGETALL" || c == "SMEMBERS" || c == "ZRANGE" || c == "PING" {
+        return true
+    }
+    if c == "SCAN" || c == "HSCAN" || c == "SSCAN" || c == "ZSCAN" {
+        return true
+    }
+    if c == "DEL" || c == "HSET" || c == "SADD" || c == "SREM" || c == "PERSIST" || c == "EXPIREAT" || c == "SELECT" {
+        return true
+    }
+    if c == "ZADD" {
+        return true
+    }
+    if c == "SET" && nargs == 2 {
+        return true
+    }
+    // EXPIRE is relative: idempotent-with-drift (documented in DOCS.md).
+    if c == "EXPIRE" {
+        return true
+    }
+    false
+}
+
+func upper(s: str) -> str {
+    out := ""
+    for b in str.bytes(s) {
+        c := b
+        if c >= 97 && c <= 122 {
+            c = c - 32
+        }
+        out = out + str.chr(c)
+    }
+    out
+}
+
+// Core exchange with policy. `idem` gates post-send IO retries;
+// `timeout_ms` overrides the read deadline for this call (0 keeps Options).
+// Public: pipe/pubsub build on it (they manage their own retry rules).
+
+pub func exchange(cli: Client, args: [str], idem: bool, timeout_ms: int) -> Result<conn.Reply, errors.RError> {
+    cmd := ""
+    if args.len() > 0 {
+        cmd = upper(args[0])
+    }
+    exchange_frame(cli, cmd, resp.encode(args), idem, timeout_ms)
+}
+
+pub func exchange_bytes(cli: Client, cmd: str, parts: [bytes], idem: bool, timeout_ms: int) -> Result<conn.Reply, errors.RError> {
+    head:[bytes] = []
+    match resp.str_part(cmd) {
+        .ok(cb) => {
+            head = head.push(cb)
+        }
+        .err(e) => return .err(e)
+    }
+    for part in parts {
+        head = head.push(part)
+    }
+    exchange_frame(cli, upper(cmd), resp.encode_bytes(head), idem, timeout_ms)
+}
+
+func exchange_frame(cli: Client, cmd: str, frame: bytes, idem: bool, timeout_ms: int) -> Result<conn.Reply, errors.RError> {
+    attempt := 0
+    while attempt <= cli.retries {
+        match live(cli) {
+            .ok(c) => {
+                apply_timeout(c, timeout_ms)?
+                match conn.send_frame(c, frame) {
+                    .ok(_) => {
+                        match conn.recv(c) {
+                            .ok(r) => {
+                                restore_read_ms(cli, c)
+                                return finish(cli, r, cmd)
+                            }
+                            .err(e) => {
+                                restore_read_ms(cli, c)
+                                if !errors.is_io(e) {
+                                    return .err(e)
+                                }
+                                if !idem {
+                                    return .err(errors.ambiguous_error(cmd))
+                                }
+                                if attempt >= cli.retries {
+                                    return .err(e)
+                                }
+                                match redial(cli) {
+                                    .ok(_) => 0
+                                    .err(_) => 0
+                                }
+                                backoff(attempt)
+                                attempt = attempt + 1
+                            }
+                        }
+                    }
+                    .err(e) => {
+                        restore_read_ms(cli, c)
+                        if !errors.is_io(e) {
+                            return .err(e)
+                        }
+                        // Write errors may mean the peer died mid-frame:
+                        // same rule as post-send (ambiguous unless idem).
+                        if !idem {
+                            return .err(errors.ambiguous_error(cmd))
+                        }
+                        if attempt >= cli.retries {
+                            return .err(e)
+                        }
+                        match redial(cli) {
+                            .ok(_) => 0
+                            .err(_) => 0
+                        }
+                        backoff(attempt)
+                        attempt = attempt + 1
+                    }
+                }
+            }
+            .err(e) => return .err(e)
+        }
+    }
+    // Unreachable: every path above returns before attempts run out, but
+    // the checker needs a tail value.
+    .err(errors.closed_error("command"))
+}
+
+func apply_timeout(c: conn.Conn, ms: int) -> Result<int, errors.RError> {
+    if ms <= 0 {
+        return .ok(0)
+    }
+    match set_read_ms(c, ms) {
+        .ok(_) => .ok(0)
+        .err(e) => .err(e)
+    }
+}
+
+func set_read_ms(c: conn.Conn, ms: int) -> Result<int, errors.RError> {
+    if c.t.mode == 1 {
+        match c.t.tl {
+            .some(s) => {
+                match s.set_read_timeout(ms) {
+                    .ok(_) => .ok(0)
+                    .err(e) => .err(errors.closed_error("command"))
+                }
+            }
+            .none => .err(errors.protocol_error("transport mode/tls mismatch (internal)"))
+        }
+    } else {
+        match c.t.tcp {
+            .some(s) => {
+                match s.set_read_timeout(ms) {
+                    .ok(_) => .ok(0)
+                    .err(e) => .err(errors.closed_error("command"))
+                }
+            }
+            .none => .err(errors.protocol_error("transport mode/tcp mismatch (internal)"))
+        }
+    }
+}
+
+func restore_read_ms(cli: Client, c: conn.Conn) -> int {
+    _ := set_read_ms(c, cli.opts.read_ms)
+    0
+}
+
+// Map a reply node to value-or-typed-error.
+
+func finish(cli: Client, r: conn.Reply, cmd: str) -> Result<conn.Reply, errors.RError> {
+    _ := cli
+    tag := resp.tag_of(r.arena, conn.reply_value(r))
+    if tag == resp.R_ERROR {
+        return .err(conn.reply_error(r.arena, r.id))
+    }
+    if tag == resp.R_PUSH {
+        return .err(errors.protocol_error("unexpected_push (subscribe-only)"))
+    }
+    .ok(r)
+}
+
+// Raw pipeline: ONE write of a pre-encoded multi-command frame, then
+// exactly nreplies reads (nreplies must equal the encoded command count;
+// pipe.zz builds the frame and counts). Never retries after the first
+// byte: a write error redials (resync) and reports sent=0; a mid-read
+// error redials and reports pipeline_partial sent=N received=K, so there
+// are no silent halves. Per-command server errors (-ERR ...) arrive as
+// R_ERROR reply VALUES in the returned array (callers inspect each one);
+// only transport/parse failures are .err. R_ERROR mapping (finish) is
+// deliberately NOT applied here.
+
+pub func raw_pipe(cli: Client, frame: bytes, nreplies: int) -> Result<[conn.Reply], errors.RError> {
+    match live(cli) {
+        .ok(c) => {
+            apply_timeout(c, 0)?
+            match conn.send_frame(c, frame) {
+                .ok(_) => read_pipe(cli, c, nreplies)
+                .err(_) => {
+                    restore_read_ms(cli, c)
+                    match redial(cli) {
+                        .ok(_) => 0
+                        .err(_) => 0
+                    }
+                    .err(pipe_partial(0, 0))
+                }
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+func read_pipe(cli: Client, c: conn.Conn, n: int) -> Result<[conn.Reply], errors.RError> {
+    out:[conn.Reply] = []
+    i := 0
+    while i < n {
+        match conn.recv(c) {
+            .ok(r) => {
+                out = out.push(r)
+                i = i + 1
+            }
+            .err(_) => {
+                restore_read_ms(cli, c)
+                match redial(cli) {
+                    .ok(_) => 0
+                    .err(_) => 0
+                }
+                return .err(pipe_partial(n, i))
+            }
+        }
+    }
+    restore_read_ms(cli, c)
+    .ok(out)
+}
+
+func pipe_partial(sent: int, received: int) -> errors.RError {
+    errors.protocol_error("pipeline_partial sent={sent} received={received}")
+}

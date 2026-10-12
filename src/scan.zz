@@ -1,0 +1,205 @@
+// scan.zz — SCAN family iterators (plan v3 §12).
+//
+// Functional paging (no hidden cursors): scan_once fetches one page,
+// scan_all loops to cursor 0. SCAN semantics are at-least-once — keys
+// may repeat or be missed under concurrent writes; pass dedupe=true to
+// collapse repeats (misses under mutation stay possible; documented).
+import redis.client as client
+import redis.conn as conn
+import redis.errors as errors
+import redis.resp as resp
+
+pub struct ScanPage {
+    cursor: int,
+    done: bool,
+    keys: [str],
+}
+
+pub struct FieldPage {
+    cursor: int,
+    done: bool,
+    fields: [str],
+}
+
+// One SCAN step. pat "" disables MATCH; count 0 disables COUNT.
+
+pub func scan_once(cli: client.Client, cursor: int, pat: str, count: int) -> Result<ScanPage, errors.RError> {
+    args := ["SCAN", "{cursor}"]
+    if pat != "" {
+        args = args.push("MATCH")
+        args = args.push(pat)
+    }
+    if count > 0 {
+        args = args.push("COUNT")
+        args = args.push("{count}")
+    }
+    match client.exchange(cli, args, true, 0) {
+        .ok(r) => page_of(r)
+        .err(e) => .err(e)
+    }
+}
+
+func page_of(r: conn.Reply) -> Result<ScanPage, errors.RError> {
+    match resp.as_array(r.arena, conn.reply_value(r)) {
+        .ok(vs) => {
+            if vs.len() != 2 {
+                return .err(errors.protocol_error("scan_arity"))
+            }
+            match resp.as_str(r.arena, vs[0]) {
+                .ok(cs) => {
+                    match resp.as_array(r.arena, vs[1]) {
+                        .ok(ks) => {
+                            out:[str] = []
+                            for k in ks {
+                                match resp.as_str(r.arena, k) {
+                                    .ok(s) => {
+                                        out = out.push(s)
+                                    }
+                                    .err(e) => return .err(e)
+                                }
+                            }
+                            cur := int(cs) ?? -1
+                            .ok(ScanPage{cursor: cur, done: cur == 0, keys: out})
+                        }
+                        .err(e) => .err(e)
+                    }
+                }
+                .err(e) => .err(e)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+// Full keyspace (dedupe optional). Bounded by server cursor termination
+// (cursor returns to 0); no client-side cap — huge keyspaces stream page
+// by page into one array (documented memory note in DOCS.md).
+
+pub func scan_all(cli: client.Client, pat: str, count: int, dedupe: bool) -> Result<[str], errors.RError> {
+    out:[str] = []
+    cursor := 0
+    first := true
+    while first || cursor != 0 {
+        first = false
+        match scan_once(cli, cursor, pat, count) {
+            .ok(p) => {
+                for k in p.keys {
+                    if dedupe {
+                        if !contains_str(out, k) {
+                            out = out.push(k)
+                        }
+                    } else {
+                        out = out.push(k)
+                    }
+                }
+                cursor = p.cursor
+                if p.done {
+                    break
+                }
+            }
+            .err(e) => return .err(e)
+        }
+    }
+    .ok(out)
+}
+
+func contains_str(xs: [str], s: str) -> bool {
+    for x in xs {
+        if x == s {
+            return true
+        }
+    }
+    false
+}
+
+// HSCAN/SSCAN/ZSCAN one step (flat field/value or member/score lists).
+
+pub func hscan_once(cli: client.Client, key: str, cursor: int, count: int) -> Result<FieldPage, errors.RError> {
+    fscan(cli, "HSCAN", key, cursor, count)
+}
+
+pub func sscan_once(cli: client.Client, key: str, cursor: int, count: int) -> Result<FieldPage, errors.RError> {
+    fscan(cli, "SSCAN", key, cursor, count)
+}
+
+pub func zscan_once(cli: client.Client, key: str, cursor: int, count: int) -> Result<FieldPage, errors.RError> {
+    fscan(cli, "ZSCAN", key, cursor, count)
+}
+
+func fscan(cli: client.Client, cmd: str, key: str, cursor: int, count: int) -> Result<FieldPage, errors.RError> {
+    args := [cmd, key, "{cursor}"]
+    if count > 0 {
+        args = args.push("COUNT")
+        args = args.push("{count}")
+    }
+    match client.exchange(cli, args, true, 0) {
+        .ok(r) => {
+            match resp.as_array(r.arena, conn.reply_value(r)) {
+                .ok(vs) => {
+                    if vs.len() != 2 {
+                        return .err(errors.protocol_error("scan_arity"))
+                    }
+                    match resp.as_str(r.arena, vs[0]) {
+                        .ok(cs) => {
+                            match resp.as_array(r.arena, vs[1]) {
+                                .ok(ks) => {
+                                    out:[str] = []
+                                    for k in ks {
+                                        match resp.as_str(r.arena, k) {
+                                            .ok(s) => {
+                                                out = out.push(s)
+                                            }
+                                            .err(e) => return .err(e)
+                                        }
+                                    }
+                                    cur := int(cs) ?? -1
+                                    .ok(FieldPage{cursor: cur, done: cur == 0, fields: out})
+                                }
+                                .err(e) => .err(e)
+                            }
+                        }
+                        .err(e) => .err(e)
+                    }
+                }
+                .err(e) => .err(e)
+            }
+        }
+        .err(e) => .err(e)
+    }
+}
+
+// Full hash/set/zset content (flat lists; zset interleaves member,score).
+
+pub func hscan_all(cli: client.Client, key: str) -> Result<[str], errors.RError> {
+    collect_fields(cli, "HSCAN", key)
+}
+
+pub func sscan_all(cli: client.Client, key: str) -> Result<[str], errors.RError> {
+    collect_fields(cli, "SSCAN", key)
+}
+
+pub func zscan_all(cli: client.Client, key: str) -> Result<[str], errors.RError> {
+    collect_fields(cli, "ZSCAN", key)
+}
+
+func collect_fields(cli: client.Client, cmd: str, key: str) -> Result<[str], errors.RError> {
+    out:[str] = []
+    cursor := 0
+    first := true
+    while first || cursor != 0 {
+        first = false
+        match fscan(cli, cmd, key, cursor, 0) {
+            .ok(p) => {
+                for f in p.fields {
+                    out = out.push(f)
+                }
+                cursor = p.cursor
+                if p.done {
+                    break
+                }
+            }
+            .err(e) => return .err(e)
+        }
+    }
+    .ok(out)
+}

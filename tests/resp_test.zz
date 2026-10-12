@@ -1,0 +1,709 @@
+// resp_test.zz — RESP encoder/parse unit tests (plan v3 §9, §14.2.1-4).
+//
+// Pure values only, no network: safe under `zz test` in CI, both engines.
+// Covers: encoder golden bytes, parser goldens for every RESP2/RESP3 type,
+// error cases (bad lengths, short reads, unknown prefixes, limit and depth
+// breaches), the framing property (every byte-offset split of every golden
+// parses incomplete-or-equal), a deterministic LCG fuzz (3000 mutations,
+// typed-error-or-ok invariant), and encode byte-exact spot checks.
+import std.bytes
+import std.str
+
+import redis.errors as errors
+import redis.resp as resp
+
+// Parsed-value bundle for helpers (arena travels with its root id).
+
+struct RGot {
+    arena: resp.Arena,
+    id: int,
+    next: int,
+}
+
+// Parse s with default limits; any error is a test failure.
+
+func rparse(s: str) -> RGot {
+    buf := str.bytes(s)
+    match resp.parse(resp.new_arena(), buf, 0, 0, resp.default_limits()) {
+        .ok(o) => RGot{arena: o.arena, id: o.id, next: o.next}
+        .err(e) => {
+            println("UNEXPECTED ERROR for {s}: {errors.message(e)}")
+            assert(false)
+            RGot{arena: resp.new_arena(), id: 0, next: 0}
+        }
+    }
+}
+
+// Parse s with custom limits; any error is a test failure.
+
+func rparse_lim(s: str, lim: resp.Limits) -> RGot {
+    buf := str.bytes(s)
+    match resp.parse(resp.new_arena(), buf, 0, 0, lim) {
+        .ok(o) => RGot{arena: o.arena, id: o.id, next: o.next}
+        .err(e) => {
+            println("UNEXPECTED ERROR for {s}: {errors.message(e)}")
+            assert(false)
+            RGot{arena: resp.new_arena(), id: 0, next: 0}
+        }
+    }
+}
+
+// Parse s with default limits; success is a test failure.
+
+func rerr(s: str) -> errors.RError {
+    buf := str.bytes(s)
+    match resp.parse(resp.new_arena(), buf, 0, 0, resp.default_limits()) {
+        .ok(o) => {
+            println("UNEXPECTED OK for {s}: id {o.id}")
+            assert(false)
+            errors.protocol_error("unreachable")
+        }
+        .err(e) => e
+    }
+}
+
+// Value handle for a parsed root.
+
+func rval(g: RGot) -> resp.Value {
+    resp.Value{id: g.id}
+}
+
+// Accessor that must succeed (any error is a test failure).
+
+func rok_str(g: RGot, v: resp.Value) -> str {
+    match resp.as_str(g.arena, v) {
+        .ok(s) => s
+        .err(e) => {
+            println("UNEXPECTED as_str ERROR: {errors.message(e)}")
+            assert(false)
+            ""
+        }
+    }
+}
+
+func rok_int(g: RGot, v: resp.Value) -> int {
+    match resp.as_int(g.arena, v) {
+        .ok(n) => n
+        .err(e) => {
+            println("UNEXPECTED as_int ERROR: {errors.message(e)}")
+            assert(false)
+            0
+        }
+    }
+}
+
+func rok_bytes(g: RGot, v: resp.Value) -> [int] {
+    match resp.as_bytes(g.arena, v) {
+        .ok(b) => b
+        .err(e) => {
+            println("UNEXPECTED as_bytes ERROR: {errors.message(e)}")
+            assert(false)
+            empty:[int] = []
+            empty
+        }
+    }
+}
+
+func rok_arr(g: RGot, v: resp.Value) -> [resp.Value] {
+    match resp.as_array(g.arena, v) {
+        .ok(k) => k
+        .err(e) => {
+            println("UNEXPECTED as_array ERROR: {errors.message(e)}")
+            assert(false)
+            empty:[resp.Value] = []
+            empty
+        }
+    }
+}
+
+func rok_map(g: RGot, v: resp.Value) -> [resp.Value] {
+    match resp.as_map(g.arena, v) {
+        .ok(k) => k
+        .err(e) => {
+            println("UNEXPECTED as_map ERROR: {errors.message(e)}")
+            assert(false)
+            empty:[resp.Value] = []
+            empty
+        }
+    }
+}
+
+func rok_errtext(g: RGot, v: resp.Value) -> str {
+    match resp.err_text(g.arena, v) {
+        .ok(s) => s
+        .err(e) => {
+            println("UNEXPECTED err_text ERROR: {errors.message(e)}")
+            assert(false)
+            ""
+        }
+    }
+}
+
+// True when the accessor fails with a protocol error (mismatch fence).
+
+func rno_str(g: RGot, v: resp.Value) -> bool {
+    match resp.as_str(g.arena, v) {
+        .ok(_) => false
+        .err(e) => e.kind == "protocol"
+    }
+}
+
+func rno_bytes(g: RGot, v: resp.Value) -> bool {
+    match resp.as_bytes(g.arena, v) {
+        .ok(_) => false
+        .err(e) => e.kind == "protocol"
+    }
+}
+
+func rno_int(g: RGot, v: resp.Value) -> bool {
+    match resp.as_int(g.arena, v) {
+        .ok(_) => false
+        .err(e) => e.kind == "protocol"
+    }
+}
+
+func rno_arr(g: RGot, v: resp.Value) -> bool {
+    match resp.as_array(g.arena, v) {
+        .ok(_) => false
+        .err(e) => e.kind == "protocol"
+    }
+}
+
+func rno_map(g: RGot, v: resp.Value) -> bool {
+    match resp.as_map(g.arena, v) {
+        .ok(_) => false
+        .err(e) => e.kind == "protocol"
+    }
+}
+
+func rno_errtext(g: RGot, v: resp.Value) -> bool {
+    match resp.err_text(g.arena, v) {
+        .ok(_) => false
+        .err(e) => e.kind == "protocol"
+    }
+}
+// Golden corpus: every stream is one exact single value. Shared by the
+// framing property test and the fuzz seed pool.
+
+func rcorpus() -> [str] {
+    c:[str] = []
+    c = c.push("+OK\r\n")
+    c = c.push("-ERR unknown command\r\n")
+    c = c.push("-MOVED 3999 127.0.0.1:6381\r\n")
+    c = c.push(":42\r\n")
+    c = c.push(":-7\r\n")
+    c = c.push("$-1\r\n")
+    c = c.push("*-1\r\n")
+    c = c.push("_\r\n")
+    c = c.push("*0\r\n")
+    c = c.push("$0\r\n\r\n")
+    c = c.push("$5\r\nhello\r\n")
+    c = c.push("$5\r\na\r\n\x00b\r\n")
+    c = c.push("*2\r\n+OK\r\n:1\r\n")
+    c = c.push("*2\r\n*2\r\n+a\r\n+b\r\n*0\r\n")
+    c = c.push("%0\r\n")
+    c = c.push("%1\r\n$1\r\na\r\n$1\r\nb\r\n")
+    c = c.push("~2\r\n+a\r\n+b\r\n")
+    c = c.push("#t\r\n")
+    c = c.push("#f\r\n")
+    c = c.push(",1.5\r\n")
+    c = c.push("(123456789012345678901234567890\r\n")
+    c = c.push("=17\r\ntxt:hello, world!\r\n")
+    c = c.push(">2\r\n+hi\r\n+there\r\n")
+    c = c.push("|1\r\n+key\r\n:1\r\n")
+    c
+}
+
+// ---- Encoder goldens ----
+
+@test
+func resp_encode_ping_golden() {
+    got := bytes.to_ints(resp.encode(["PING"]))
+    assert_eq(got, str.bytes("*1\r\n$4\r\nPING\r\n"))
+}
+
+@test
+func resp_encode_empty_argv_is_star_zero() {
+    got := bytes.to_ints(resp.encode([]))
+    assert_eq(got, str.bytes("*0\r\n"))
+}
+
+@test
+func resp_encode_binary_arg_uses_byte_len() {
+    // a, CR, LF, NUL, b: 5 bytes (len in chars would also say 5 here, but
+    // the length is measured on str.bytes output, never on chars).
+    got := bytes.to_ints(resp.encode(["a\r\n\x00b"]))
+    assert_eq(got, str.bytes("*1\r\n$5\r\na\r\n\x00b\r\n"))
+}
+
+@test
+func resp_encode_multi_arg_golden() {
+    got := bytes.to_ints(resp.encode(["SET", "key", "val"]))
+    assert_eq(got, str.bytes("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nval\r\n"))
+}
+
+@test
+func resp_encode_multibyte_chars_count_bytes() {
+    // é is 2 bytes in UTF-8: the frame must say $3 for "hé".
+    got := bytes.to_ints(resp.encode(["hé"]))
+    assert_eq(got, str.bytes("*1\r\n$3\r\nhé\r\n"))
+}
+
+// ---- Parser goldens: scalars ----
+
+@test
+func resp_parse_simple_string() {
+    g := rparse("+OK\r\n")
+    assert_eq(g.next, len(str.bytes("+OK\r\n")))
+    assert_eq(resp.tag_of(g.arena, rval(g)), resp.R_SIMPLE)
+    assert(resp.is_null(g.arena, rval(g)) == false)
+    assert_eq(rok_str(g, rval(g)), "OK")
+    assert_eq(rok_bytes(g, rval(g)), str.bytes("OK"))
+}
+
+@test
+func resp_parse_error_reply_keeps_text() {
+    g := rparse("-ERR unknown command\r\n")
+    assert_eq(g.next, len(str.bytes("-ERR unknown command\r\n")))
+    assert_eq(resp.tag_of(g.arena, rval(g)), resp.R_ERROR)
+    assert_eq(rok_errtext(g, rval(g)), "ERR unknown command")
+    m := rparse("-MOVED 3999 127.0.0.1:6381\r\n")
+    assert_eq(rok_errtext(m, rval(m)), "MOVED 3999 127.0.0.1:6381")
+}
+
+@test
+func resp_parse_integers() {
+    g := rparse(":42\r\n")
+    assert_eq(g.next, len(str.bytes(":42\r\n")))
+    assert_eq(resp.tag_of(g.arena, rval(g)), resp.R_INT)
+    assert_eq(rok_int(g, rval(g)), 42)
+    h := rparse(":-7\r\n")
+    assert_eq(rok_int(h, rval(h)), 0 - 7)
+}
+
+@test
+func resp_parse_null_forms() {
+    for s in ["$-1\r\n", "*-1\r\n", "_\r\n"] {
+        g := rparse(s)
+        assert_eq(g.next, len(str.bytes(s)))
+        assert_eq(resp.tag_of(g.arena, rval(g)), resp.R_NULL)
+        assert(resp.is_null(g.arena, rval(g)))
+    }
+}
+
+@test
+func resp_parse_bulk_and_empty() {
+    g := rparse("$5\r\nhello\r\n")
+    assert_eq(g.next, len(str.bytes("$5\r\nhello\r\n")))
+    assert_eq(resp.tag_of(g.arena, rval(g)), resp.R_BULK)
+    assert_eq(rok_str(g, rval(g)), "hello")
+    assert_eq(rok_bytes(g, rval(g)), str.bytes("hello"))
+    e := rparse("$0\r\n\r\n")
+    assert_eq(g.next, len(str.bytes("$5\r\nhello\r\n")))
+    assert_eq(rok_str(e, rval(e)), "")
+    assert_eq(len(rok_bytes(e, rval(e))), 0)
+    b := rparse("$5\r\na\r\n\x00b\r\n")
+    assert_eq(rok_bytes(b, rval(b)), str.bytes("a\r\n\x00b"))
+}
+
+@test
+func resp_parse_bool_pair() {
+    t := rparse("#t\r\n")
+    assert_eq(resp.tag_of(t.arena, rval(t)), resp.R_BOOL)
+    assert_eq(rok_int(t, rval(t)), 1)
+    f := rparse("#f\r\n")
+    assert_eq(rok_int(f, rval(f)), 0)
+}
+
+@test
+func resp_parse_double_and_big_are_text() {
+    d := rparse(",1.5\r\n")
+    assert_eq(resp.tag_of(d.arena, rval(d)), resp.R_DOUBLE)
+    assert(resp.is_null(d.arena, rval(d)) == false)
+    n := rparse("(123456789012345678901234567890\r\n")
+    assert_eq(resp.tag_of(n.arena, rval(n)), resp.R_BIG)
+    // Same text parses equal; different text does not.
+    d2 := rparse(",1.5\r\n")
+    assert(resp.deep_equal(d.arena, rval(d), d2.arena, rval(d2)))
+    d3 := rparse(",1.50\r\n")
+    assert(resp.deep_equal(d.arena, rval(d), d3.arena, rval(d3)) == false)
+}
+
+@test
+func resp_parse_verbatim_strips_ext() {
+    g := rparse("=17\r\ntxt:hello, world!\r\n")
+    assert_eq(g.next, len(str.bytes("=17\r\ntxt:hello, world!\r\n")))
+    assert_eq(resp.tag_of(g.arena, rval(g)), resp.R_VERB)
+    assert(resp.is_null(g.arena, rval(g)) == false)
+    // Content is fenced: no text/bytes/int/array/map accessor reaches it.
+    assert(rno_str(g, rval(g)))
+    assert(rno_bytes(g, rval(g)))
+    assert(rno_int(g, rval(g)))
+    assert(rno_arr(g, rval(g)))
+    assert(rno_map(g, rval(g)))
+    assert(rno_errtext(g, rval(g)))
+    // But the node round-trips through deep_equal, unlike a bulk twin.
+    g2 := rparse("=17\r\ntxt:hello, world!\r\n")
+    assert(resp.deep_equal(g.arena, rval(g), g2.arena, rval(g2)))
+    bulk := rparse("$13\r\nhello, world!\r\n")
+    assert(resp.deep_equal(g.arena, rval(g), bulk.arena, rval(bulk)) == false)
+}
+
+// ---- Parser goldens: aggregates ----
+
+@test
+func resp_parse_arrays_flat_and_nested() {
+    g := rparse("*2\r\n+OK\r\n:1\r\n")
+    assert_eq(g.next, len(str.bytes("*2\r\n+OK\r\n:1\r\n")))
+    assert_eq(resp.tag_of(g.arena, rval(g)), resp.R_ARRAY)
+    kids := rok_arr(g, rval(g))
+    assert_eq(len(kids), 2)
+    assert_eq(rok_str(g, kids[0]), "OK")
+    assert_eq(rok_int(g, kids[1]), 1)
+    e := rparse("*0\r\n")
+    assert_eq(len(rok_arr(e, rval(e))), 0)
+    n := rparse("*2\r\n*2\r\n+a\r\n+b\r\n*0\r\n")
+    outer := rok_arr(n, rval(n))
+    assert_eq(len(outer), 2)
+    inner := rok_arr(n, outer[0])
+    assert_eq(len(inner), 2)
+    assert_eq(rok_str(n, inner[1]), "b")
+    assert_eq(len(rok_arr(n, outer[1])), 0)
+}
+
+@test
+func resp_parse_map_needs_as_map() {
+    g := rparse("%1\r\n$1\r\na\r\n$1\r\nb\r\n")
+    assert_eq(resp.tag_of(g.arena, rval(g)), resp.R_MAP)
+    flat := rok_map(g, rval(g))
+    assert_eq(len(flat), 2)
+    assert_eq(rok_str(g, flat[0]), "a")
+    assert_eq(rok_str(g, flat[1]), "b")
+    // as_array rejects maps (points at as_map).
+    match resp.as_array(g.arena, rval(g)) {
+        .ok(_) => {
+            println("as_array accepted a map")
+            assert(false)
+        }
+        .err(e) => {
+            assert_eq(e.kind, "protocol")
+            assert(str.contains(e.detail, "unexpected_type"))
+        }
+    }
+    e := rparse("%0\r\n")
+    assert_eq(len(rok_map(e, rval(e))), 0)
+}
+
+@test
+func resp_parse_set_push_attr() {
+    s := rparse("~2\r\n+a\r\n+b\r\n")
+    assert_eq(resp.tag_of(s.arena, rval(s)), resp.R_SET)
+    sk := rok_arr(s, rval(s))
+    assert_eq(len(sk), 2)
+    assert_eq(rok_str(s, sk[0]), "a")
+    p := rparse(">2\r\n+hi\r\n+there\r\n")
+    assert_eq(resp.tag_of(p.arena, rval(p)), resp.R_PUSH)
+    pk := rok_arr(p, rval(p))
+    assert_eq(len(pk), 2)
+    assert_eq(rok_str(p, pk[1]), "there")
+    t := rparse("|1\r\n+key\r\n:1\r\n")
+    assert_eq(resp.tag_of(t.arena, rval(t)), resp.R_ATTR)
+    flat := rok_map(t, rval(t))
+    assert_eq(len(flat), 2)
+    assert_eq(rok_str(t, flat[0]), "key")
+    assert_eq(rok_int(t, flat[1]), 1)
+}
+
+// ---- Accessor mismatch table ----
+
+@test
+func resp_accessors_reject_mismatches() {
+    i := rparse(":5\r\n")
+    match resp.as_str(i.arena, rval(i)) {
+        .ok(_) => {
+            println("as_str accepted an int")
+            assert(false)
+        }
+        .err(e) => assert(str.contains(e.detail, "unexpected_type"))
+    }
+    match resp.err_text(i.arena, rval(i)) {
+        .ok(_) => {
+            println("err_text accepted an int")
+            assert(false)
+        }
+        .err(e) => assert(str.contains(e.detail, "unexpected_type"))
+    }
+    b := rparse("$1\r\n5\r\n")
+    match resp.as_int(b.arena, rval(b)) {
+        .ok(_) => {
+            println("as_int accepted a bulk")
+            assert(false)
+        }
+        .err(e) => assert(str.contains(e.detail, "unexpected_type"))
+    }
+    a := rparse("*1\r\n+a\r\n")
+    match resp.as_map(a.arena, rval(a)) {
+        .ok(_) => {
+            println("as_map accepted an array")
+            assert(false)
+        }
+        .err(e) => assert(str.contains(e.detail, "unexpected_type"))
+    }
+    s := rparse("+x\r\n")
+    match resp.as_array(s.arena, rval(s)) {
+        .ok(_) => {
+            println("as_array accepted a simple")
+            assert(false)
+        }
+        .err(e) => assert(str.contains(e.detail, "unexpected_type"))
+    }
+    // Bad ids never panic: tag_of reports -1, accessors fail typed.
+    bad := resp.Value{id: 9999}
+    assert_eq(resp.tag_of(i.arena, bad), 0 - 1)
+    assert(resp.is_null(i.arena, bad) == false)
+    assert(rno_str(i, bad))
+    assert(resp.deep_equal(i.arena, bad, i.arena, rval(i)) == false)
+}
+
+@test
+func resp_deep_equal_cross_arena() {
+    a := rparse("*2\r\n+a\r\n:1\r\n")
+    b := rparse("*2\r\n+a\r\n:1\r\n")
+    assert(resp.deep_equal(a.arena, rval(a), b.arena, rval(b)))
+    c := rparse("*2\r\n+a\r\n:2\r\n")
+    assert(resp.deep_equal(a.arena, rval(a), c.arena, rval(c)) == false)
+    d := rparse("$1\r\na\r\n")
+    e := rparse("+a\r\n")
+    assert(resp.deep_equal(d.arena, rval(d), e.arena, rval(e)) == false)
+}
+
+// ---- Error cases ----
+
+@test
+func resp_error_negative_length() {
+    e := rerr("$-2\r\n")
+    assert_eq(e.kind, "protocol")
+    assert(str.contains(e.detail, "bad_length"))
+    e2 := rerr("*-2\r\n")
+    assert(str.contains(e2.detail, "bad_length"))
+}
+
+@test
+func resp_error_short_reads_are_incomplete() {
+    e := rerr("$5\r\nabc")
+    assert_eq(e.kind, "protocol")
+    assert(str.contains(e.detail, "incomplete"))
+    e2 := rerr("*2\r\n+a\r\n")
+    assert(str.contains(e2.detail, "incomplete"))
+    e3 := rerr("+OK")
+    assert(str.contains(e3.detail, "incomplete"))
+    e4 := rerr("")
+    assert(str.contains(e4.detail, "incomplete"))
+}
+
+@test
+func resp_error_unknown_prefix() {
+    e := rerr("X9\r\n")
+    assert_eq(e.kind, "protocol")
+    assert(str.contains(e.detail, "unknown_type"))
+}
+
+@test
+func resp_error_missing_crlf() {
+    e := rerr("$5\r\nhelloXX")
+    assert_eq(e.kind, "protocol")
+    assert(str.contains(e.detail, "missing_crlf"))
+}
+
+@test
+func resp_error_bulk_over_custom_limit() {
+    lim := resp.Limits{max_bulk: 10, max_array: 1000000, max_depth: 32, max_line: 65536}
+    buf := str.bytes("$100\r\nhello\r\n")
+    match resp.parse(resp.new_arena(), buf, 0, 0, lim) {
+        .ok(_) => {
+            println("oversize bulk accepted")
+            assert(false)
+        }
+        .err(e) => {
+            assert_eq(e.kind, "protocol")
+            assert(str.contains(e.detail, "max_bulk"))
+        }
+    }
+}
+
+@test
+func resp_error_line_over_custom_limit() {
+    lim := resp.Limits{max_bulk: 536870912, max_array: 1000000, max_depth: 32, max_line: 4}
+    buf := str.bytes("+hello\r\n")
+    match resp.parse(resp.new_arena(), buf, 0, 0, lim) {
+        .ok(_) => {
+            println("overlong line accepted")
+            assert(false)
+        }
+        .err(e) => {
+            assert_eq(e.kind, "protocol")
+            assert(str.contains(e.detail, "max_line"))
+        }
+    }
+}
+
+@test
+func resp_error_depth_breach_and_depth_ok() {
+    deep := "+x\r\n"
+    i := 0
+    while i < 33 {
+        deep = "*1\r\n" + deep
+        i = i + 1
+    }
+    e := rerr(deep)
+    assert_eq(e.kind, "protocol")
+    assert(str.contains(e.detail, "max_depth"))
+    // One level less (32) parses fine under the default depth of 32.
+    ok := "+x\r\n"
+    j := 0
+    while j < 32 {
+        ok = "*1\r\n" + ok
+        j = j + 1
+    }
+    g := rparse(ok)
+    assert_eq(resp.tag_of(g.arena, rval(g)), resp.R_ARRAY)
+}
+
+@test
+func resp_error_bad_bool_and_bad_null() {
+    e := rerr("#x\r\n")
+    assert_eq(e.kind, "protocol")
+    assert(str.contains(e.detail, "bad_bool"))
+    e2 := rerr("_nope\r\n")
+    assert(str.contains(e2.detail, "bad_null"))
+}
+
+// ---- Framing property: every byte-offset split ----
+
+@test
+func resp_framing_every_split() {
+    for s in rcorpus() {
+        full := str.bytes(s)
+        g := rparse(s)
+        assert_eq(g.next, len(full))
+        k := 0
+        while k <= len(full) {
+            pre := full[0:k]
+            match resp.parse(resp.new_arena(), pre, 0, 0, resp.default_limits()) {
+                .ok(o) => {
+                    // A complete prefix must hold the golden value exactly
+                    // and never consume past the split.
+                    assert(o.next <= len(pre))
+                    assert(resp.deep_equal(o.arena, resp.Value{id: o.id}, g.arena, rval(g)))
+                }
+                .err(e) => {
+                    assert_eq(e.kind, "protocol")
+                    assert(str.contains(e.detail, "incomplete"))
+                }
+            }
+            k = k + 1
+        }
+    }
+}
+
+// ---- Deterministic fuzz: mutations stay typed ----
+
+func rrnd_next(state: int) -> int {
+    state * 1103515245 + 12345
+}
+
+// Positive remainder even when the LCG state went negative (ZZ ints wrap,
+// and % keeps the sign, so shift back up by n).
+
+func rmod_pos(state: int, n: int) -> int {
+    r := state % n
+    if r < 0 {
+        r = r + n
+    }
+    r
+}
+
+func rwith_byte(buf: [int], idx: int, v: int) -> [int] {
+    out:[int] = []
+    i := 0
+    while i < len(buf) {
+        if i == idx {
+            out = out.push(v)
+        } else {
+            out = out.push(buf[i])
+        }
+        i = i + 1
+    }
+    out
+}
+
+func rinsert_byte(buf: [int], idx: int, v: int) -> [int] {
+    out:[int] = []
+    i := 0
+    while i < len(buf) {
+        if i == idx {
+            out = out.push(v)
+        }
+        out = out.push(buf[i])
+        i = i + 1
+    }
+    if idx >= len(buf) {
+        out = out.push(v)
+    }
+    out
+}
+
+@test
+func resp_fuzz_mutations_stay_typed() {
+    seeds := rcorpus()
+    ncorpus := len(seeds)
+    state := 987654321
+    total := 0
+    errs := 0
+    it := 0
+    while it < 3000 {
+        state = rrnd_next(state)
+        pick := rmod_pos(state, ncorpus)
+        base := str.bytes(seeds[pick])
+        state = rrnd_next(state)
+        kind := rmod_pos(state, 3)
+        inp := base
+        if kind == 0 {
+            // Flip one random byte to a random value.
+            if len(inp) > 0 {
+                state = rrnd_next(state)
+                idx := rmod_pos(state, len(inp))
+                state = rrnd_next(state)
+                v := rmod_pos(state, 256)
+                inp = rwith_byte(inp, idx, v)
+            }
+        } else if kind == 1 {
+            // Truncate at a random cut (possibly to empty).
+            state = rrnd_next(state)
+            cut := rmod_pos(state, len(inp) + 1)
+            inp = inp[0:cut]
+        } else {
+            // Duplicate a random byte value at a random spot.
+            state = rrnd_next(state)
+            idx := rmod_pos(state, len(inp) + 1)
+            state = rrnd_next(state)
+            v := rmod_pos(state, 256)
+            inp = rinsert_byte(inp, idx, v)
+        }
+        match resp.parse(resp.new_arena(), inp, 0, 0, resp.default_limits()) {
+            .ok(_) => {
+                total = total + 1
+            }
+            .err(e) => {
+                assert_eq(e.kind, "protocol")
+                errs = errs + 1
+                total = total + 1
+            }
+        }
+        it = it + 1
+    }
+    // Sanity both ways: most mutations break (parser is strict), but some
+    // inputs stay valid (a panic or hang would fail the test first).
+    assert(errs > 0)
+    assert(errs < total)
+}

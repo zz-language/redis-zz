@@ -1,0 +1,57 @@
+import redis
+
+func create(c: redis.Client, uid: str, ttl: int) -> Result<str, redis.RError> {
+    n := c.incr("zz:ex:sess:ctr")?
+    id := "sess:{n}"
+    _u1 := c.set("zz:ex:sess:{id}", uid, ttl)?
+    .ok(id)
+}
+
+func get(c: redis.Client, id: str) -> Result<Option<str>, redis.RError> {
+    c.get("zz:ex:sess:{id}")
+}
+
+func touch(c: redis.Client, id: str, ttl: int) -> Result<int, redis.RError> {
+    c.expire("zz:ex:sess:{id}", ttl)
+}
+
+func destroy(c: redis.Client, id: str) -> Result<int, redis.RError> {
+    c.del(["zz:ex:sess:{id}"])
+}
+
+func show_get(c: redis.Client, id: str) -> Result<int, redis.RError> {
+    match get(c, id)? {
+        .some(uid) => show_uid(uid)
+        .none => show_miss()
+    }
+}
+
+func show_uid(uid: str) -> Result<int, redis.RError> {
+    println("session_uid={uid}")
+    assert(uid == "u:42")
+    .ok(0)
+}
+
+func show_miss() -> Result<int, redis.RError> {
+    println("session_miss")
+    .ok(0)
+}
+
+func main() -> Result<int, redis.RError> {
+    c := redis.connect("redis://127.0.0.1:6379")?
+    _u2 := c.del(["zz:ex:sess:ctr"])?
+    id := create(c, "u:42", 60)?
+    println("session_id={id}")
+    _u3 := show_get(c, id)?
+    _u4 := touch(c, id, 120)?
+    ttl := c.ttl("zz:ex:sess:{id}")?
+    fresh := ttl > 0
+    println("ttl_fresh={fresh}")
+    assert(ttl > 0)
+    _u5 := destroy(c, id)?
+    _u6 := show_get(c, id)?
+    _u7 := c.del(["zz:ex:sess:ctr"])?
+    _u8 := c.close()
+    println("sessions_ok")
+    .ok(0)
+}
